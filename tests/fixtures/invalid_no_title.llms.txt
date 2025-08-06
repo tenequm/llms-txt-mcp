@@ -1,0 +1,3 @@
+> This file is missing the required H1 title
+
+Some content here but no title means this is invalid according to the spec.
