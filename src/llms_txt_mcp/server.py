@@ -1,13 +1,12 @@
 """llms-txt-mcp: Lean Documentation MCP via llms.txt.
 
-Implements four tools as per plan:
-- docs_sources
-- docs_search
-- docs_get
-- docs_refresh
+Implements three focused tools:
+- docs_query: Primary unified search + retrieval interface with auto-retrieve
+- docs_sources: List indexed documentation sources
+- docs_refresh: Force refresh cached documentation
 
 Parses both AI SDK YAML-frontmatter llms.txt and official llms.txt headings.
-Embeds with thenlper/gte-small into a unified Chroma collection with host metadata.
+Embeds with BAAI/bge-small-en-v1.5 into a unified Chroma collection with host metadata.
 Enforces TTL + ETag/Last-Modified for freshness. Ephemeral by default; optional disk store.
 
 Follows latest FastMCP patterns from the MCP Python SDK.
@@ -93,6 +92,9 @@ class SearchResult(BaseModel):
     title: str = Field(description="Document title")
     description: str = Field(default="", description="Document description")
     score: float = Field(description="Similarity score (0-1)")
+    score_category: str = Field(description="Relevance category: high/medium/low")
+    auto_retrieved: bool = Field(default=False, description="Whether content was auto-retrieved")
+    snippet: str = Field(default="", description="Relevant content snippet")
 
 
 class DocContent(BaseModel):
@@ -105,25 +107,32 @@ class DocContent(BaseModel):
     content: str = Field(description="Full or truncated content")
 
 
-class MergedContent(BaseModel):
-    """Merged document content response."""
-
-    merged: bool = Field(default=True, description="Whether content was merged")
-    content: str = Field(description="Combined content from multiple documents")
-
-
-class SeparateContent(BaseModel):
-    """Separate document content response."""
-
-    merged: bool = Field(default=False, description="Whether content was merged")
-    items: list[DocContent] = Field(description="Individual document contents")
-
-
 class RefreshResult(BaseModel):
     """Result of refreshing documentation sources."""
 
     refreshed: list[str] = Field(description="URLs that were refreshed")
     counts: dict[str, int] = Field(description="Document counts per source")
+
+
+class QueryMetadata(BaseModel):
+    """Metadata about the query execution."""
+
+    auto_retrieved_count: int = Field(description="Number of documents auto-retrieved")
+    total_results: int = Field(description="Total search results found")
+    query_interpretation: str = Field(description="How the query was processed")
+    suggestion: str = Field(default="", description="Suggestion for better results")
+    auto_retrieve_threshold: float = Field(description="Threshold used for auto-retrieval")
+
+
+class QueryResult(BaseModel):
+    """Combined search and retrieval result."""
+
+    search_results: list[SearchResult] = Field(description="Search results with scores")
+    retrieved_content: dict[str, DocContent] = Field(
+        default_factory=dict, description="Auto-retrieved document contents"
+    )
+    merged_content: str = Field(default="", description="Merged content if merge=true")
+    metadata: QueryMetadata = Field(description="Query execution metadata")
 
 
 # -------------------------
@@ -133,17 +142,17 @@ class RefreshResult(BaseModel):
 
 class LazyEmbeddingModel:
     """Loads embedding model only when first needed."""
-    
+
     def __init__(self, model_name: str):
         self.model_name = model_name
         self._model: SentenceTransformer | None = None
-        
+
     def get(self) -> SentenceTransformer:
         if self._model is None:
             logger.info(f"Loading embedding model on first use: {self.model_name}")
             self._model = SentenceTransformer(self.model_name)
         return self._model
-    
+
     def encode(self, texts):
         """Forward encode calls to the actual model."""
         return self.get().encode(texts)
@@ -169,6 +178,9 @@ default_max_get_bytes_var: ContextVar[int] = ContextVar("default_max_get_bytes",
 store_mode_var: ContextVar[str] = ContextVar("store_mode", default="memory")
 store_path_var: ContextVar[str | None] = ContextVar("store_path", default=None)
 index_manager_var: ContextVar[IndexManager | None] = ContextVar("index_manager", default=None)
+auto_retrieve_threshold_var: ContextVar[float] = ContextVar("auto_retrieve_threshold", default=0.1)
+auto_retrieve_limit_var: ContextVar[int] = ContextVar("auto_retrieve_limit", default=5)
+include_snippets_var: ContextVar[bool] = ContextVar("include_snippets", default=True)
 
 
 # Getter functions for context variables
@@ -202,6 +214,18 @@ def get_default_max_get_bytes() -> int:
 
 def get_index_manager() -> IndexManager | None:
     return index_manager_var.get()
+
+
+def get_auto_retrieve_threshold() -> float:
+    return auto_retrieve_threshold_var.get()
+
+
+def get_auto_retrieve_limit() -> int:
+    return auto_retrieve_limit_var.get()
+
+
+def get_include_snippets() -> bool:
+    return include_snippets_var.get()
 
 
 # -------------------------
@@ -256,18 +280,61 @@ def canonical_id(source_url: str, title: str) -> str:
 
 def get_content_hash(content: str, max_bytes: int = 1024) -> str:
     """Create a hash of content for change detection.
-    
+
     Uses MD5 hash of first max_bytes for performance.
     This is NOT for security, just for change detection.
     """
     import hashlib
-    
-    sample = content[:max_bytes].encode('utf-8')
+
+    sample = content[:max_bytes].encode("utf-8")
     return hashlib.md5(sample).hexdigest()[:12]  # 12 chars is enough for our use case
 
 
 def host_of(url: str) -> str:
     return urlparse(url).netloc
+
+
+def categorize_score(score: float) -> str:
+    """Categorize similarity score into human-readable relevance."""
+    if score >= 0.3:
+        return "high"
+    elif score >= 0.15:
+        return "medium"
+    else:
+        return "low"
+
+
+def extract_snippet(content: str, query_terms: list[str], max_length: int = 200) -> str:
+    """Extract a relevant snippet from content based on query terms."""
+    if not content or not query_terms:
+        return content[:max_length] + "..." if len(content) > max_length else content
+
+    content_lower = content.lower()
+    query_lower = [term.lower() for term in query_terms]
+
+    # Find the first occurrence of any query term
+    best_pos = len(content)
+    for term in query_lower:
+        pos = content_lower.find(term)
+        if pos != -1 and pos < best_pos:
+            best_pos = pos
+
+    if best_pos == len(content):
+        # No query terms found, return beginning
+        return content[:max_length] + "..." if len(content) > max_length else content
+
+    # Extract snippet around the found term
+    start = max(0, best_pos - 50)
+    end = min(len(content), start + max_length)
+    snippet = content[start:end]
+
+    # Add ellipsis if truncated
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(content):
+        snippet = snippet + "..."
+
+    return snippet
 
 
 # -------------------------
@@ -550,7 +617,7 @@ class IndexManager:
             cid = f"{canonical_id(source_url, sec_title)}-{idx:03d}"
             ids.append(cid)
             # Emphasize description in embedding by repeating it
-            embedding_text = f"{sec_title}\n{sec_desc}\n{sec_desc}\n{sec_content[:500]}"
+            embedding_text = f"{sec_title}\n{sec_desc}\n{sec_desc}\n{sec_content}"
             docs.append(embedding_text)
             metadatas.append(
                 {
@@ -560,7 +627,9 @@ class IndexManager:
                     "title": sec_title,
                     "description": sec_desc,  # Add description to metadata
                     "content": sec_content,
-                    "content_hash": get_content_hash(sec_content),  # Add content hash for change detection
+                    "content_hash": get_content_hash(
+                        sec_content
+                    ),  # Add content hash for change detection
                     "section_index": idx,  # Add section index for ordering
                 }
             )
@@ -595,7 +664,9 @@ class IndexManager:
             doc_count=len(ids),
         )
 
-    def search(self, query: str, hosts: list[str] | None, limit: int) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, hosts: list[str] | None, limit: int, include_snippets: bool = True
+    ) -> list[dict[str, Any]]:
         collection = self.ensure_collection()
         embedding_model = get_embedding_model()
         if embedding_model is None:
@@ -609,17 +680,31 @@ class IndexManager:
         items: list[dict[str, Any]] = []
         metas = res.get("metadatas", [[]])[0]
         dists = res.get("distances", [[]])[0]
+
+        # Parse query terms for snippet extraction
+        query_terms = query.split() if include_snippets else []
+
         for meta, dist in zip(metas, dists):
             if hosts and meta.get("host") not in hosts:
                 continue
             score = max(0.0, 1.0 - float(dist))
+
+            # Extract snippet if requested
+            snippet = ""
+            if include_snippets and query_terms:
+                content = str(meta.get("content", ""))
+                snippet = extract_snippet(content, query_terms)
+
             items.append(
                 {
                     "id": meta.get("id"),
                     "source": meta.get("source"),
                     "title": meta.get("title"),
-                    "description": meta.get("description", ""),  # Include description in results
+                    "description": meta.get("description", ""),
                     "score": round(score, 3),
+                    "score_category": categorize_score(score),
+                    "auto_retrieved": False,  # Will be set by caller
+                    "snippet": snippet,
                 }
             )
             if len(items) >= limit:
@@ -698,50 +783,6 @@ async def docs_sources() -> list[SourceInfo]:
 
 
 @mcp.tool()
-async def docs_search(
-    query: str = Field(description="Search query text"),
-    hosts: list[str] | None = Field(default=None, description="Filter results by host domains"),
-    limit: int = Field(default=10, description="Maximum number of results to return"),
-) -> list[SearchResult]:
-    """Search docs by semantic similarity. Returns id, title, snippet, score."""
-    index = get_index_manager()
-    if index is None:
-        raise RuntimeError("Server not initialized")
-
-    for url in list(get_allowed_urls()):
-        await index.maybe_refresh(url)
-
-    results = index.search(query=query, hosts=hosts, limit=limit)
-    return [SearchResult(**item) for item in results]
-
-
-@mcp.tool()
-async def docs_get(
-    ids: list[str] = Field(description="Document IDs to retrieve"),
-    max_bytes: int | None = Field(default=None, description="Maximum bytes to return per document"),
-    merge: bool = Field(
-        default=False, description="Whether to merge documents into a single response"
-    ),
-) -> MergedContent | SeparateContent:
-    """Fetch full content by IDs from search. Merge=true combines sections."""
-    index = get_index_manager()
-    if index is None:
-        raise RuntimeError("Server not initialized")
-
-    implicated_sources = {cid.split("#", 1)[0] for cid in ids if "#" in cid}
-    allowed_urls = get_allowed_urls()
-    for src in implicated_sources:
-        if src in allowed_urls:
-            await index.maybe_refresh(src)
-
-    result = index.get(ids=ids, max_bytes=max_bytes, merge=merge)
-    if result.get("merged"):
-        return MergedContent(content=result["content"])
-    else:
-        return SeparateContent(items=[DocContent(**item) for item in result["items"]])
-
-
-@mcp.tool()
 async def docs_refresh(
     source: str | None = Field(
         default=None, description="Specific source URL to refresh, or None for all"
@@ -780,6 +821,109 @@ async def docs_refresh(
     )
 
 
+@mcp.tool()
+async def docs_query(
+    query: str = Field(description="Search query text"),
+    hosts: list[str] | None = Field(default=None, description="Filter results by host domains"),
+    limit: int = Field(default=10, description="Maximum number of search results"),
+    auto_retrieve: bool = Field(default=True, description="Auto-retrieve top relevant results"),
+    auto_retrieve_threshold: float | None = Field(
+        default=None, description="Min score for auto-retrieve (default: 0.1)"
+    ),
+    auto_retrieve_limit: int | None = Field(
+        default=None, description="Max docs to auto-retrieve (default: 5)"
+    ),
+    retrieve_ids: list[str] | None = Field(
+        default=None, description="Specific document IDs to retrieve"
+    ),
+    max_bytes: int | None = Field(default=None, description="Byte limit per retrieved document"),
+    merge: bool = Field(
+        default=False, description="Merge all retrieved content into single response"
+    ),
+) -> QueryResult:
+    """Search documentation with optional auto-retrieval. Combines search + get functionality."""
+    index = get_index_manager()
+    if index is None:
+        raise RuntimeError("Server not initialized")
+
+    # Use defaults from config if not provided
+    threshold = (
+        auto_retrieve_threshold
+        if auto_retrieve_threshold is not None
+        else get_auto_retrieve_threshold()
+    )
+    retrieve_limit = (
+        auto_retrieve_limit if auto_retrieve_limit is not None else get_auto_retrieve_limit()
+    )
+    include_snippets = get_include_snippets()
+
+    # Refresh stale sources
+    for url in list(get_allowed_urls()):
+        await index.maybe_refresh(url)
+
+    # Perform search
+    search_results = index.search(
+        query=query, hosts=hosts, limit=limit, include_snippets=include_snippets
+    )
+
+    # Parse query for interpretation
+    query_terms = query.split()
+    query_interpretation = f"Searched for: {', '.join(query_terms)}"
+
+    # Determine which IDs to retrieve
+    ids_to_retrieve: list[str] = []
+    auto_retrieved_count = 0
+
+    if retrieve_ids:
+        # Explicit retrieval requested
+        ids_to_retrieve.extend(retrieve_ids)
+
+    if auto_retrieve:
+        # Auto-retrieve based on score threshold
+        for result in search_results[:retrieve_limit]:
+            if result["score"] >= threshold:
+                if result["id"] not in ids_to_retrieve:
+                    ids_to_retrieve.append(result["id"])
+                    auto_retrieved_count += 1
+                # Mark as auto-retrieved
+                result["auto_retrieved"] = True
+
+    # Retrieve content
+    retrieved_content: dict[str, DocContent] = {}
+    merged_content = ""
+
+    if ids_to_retrieve:
+        result = index.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
+        if merge and result.get("merged"):
+            merged_content = result["content"]
+        else:
+            for item in result.get("items", []):
+                retrieved_content[item["id"]] = DocContent(**item)
+
+    # Generate suggestions
+    suggestion = ""
+    if not search_results:
+        suggestion = f"No results found. Try broader terms like: {', '.join(query_terms[:2])}"
+    elif auto_retrieved_count == 0 and auto_retrieve:
+        suggestion = (
+            f"Low scores found. Consider lowering threshold (current: {threshold}) "
+            f"or try related terms"
+        )
+
+    return QueryResult(
+        search_results=[SearchResult(**result) for result in search_results],
+        retrieved_content=retrieved_content,
+        merged_content=merged_content,
+        metadata=QueryMetadata(
+            auto_retrieved_count=auto_retrieved_count,
+            total_results=len(search_results),
+            query_interpretation=query_interpretation,
+            suggestion=suggestion,
+            auto_retrieve_threshold=threshold,
+        ),
+    )
+
+
 # -------------------------
 # Initialization / CLI
 # -------------------------
@@ -794,36 +938,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ttl", default="24h", help="Refresh cadence (e.g., 30m, 24h)")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
     parser.add_argument(
-        "--embed-model", default="all-MiniLM-L6-v2", help="SentenceTransformers model id"
+        "--embed-model", default="BAAI/bge-small-en-v1.5", help="SentenceTransformers model id"
     )
     parser.add_argument("--preindex", action="store_true", help="Pre-index on launch")
     parser.add_argument(
-        "--no-smart-preindex", 
+        "--no-smart-preindex",
         action="store_true",
-        help="Disable smart preindexing (by default only stale sources are indexed)"
+        help="Disable smart preindexing (by default only stale sources are indexed)",
     )
     parser.add_argument(
         "--parallel-preindex",
         type=int,
         default=3,
-        help="Number of parallel indexing tasks (default: 3)"
+        help="Number of parallel indexing tasks (default: 3)",
     )
     parser.add_argument(
         "--no-background-preindex",
         action="store_true",
-        help="Disable background preindexing (by default runs in background)"
+        help="Disable background preindexing (by default runs in background)",
     )
     parser.add_argument(
         "--no-lazy-embed",
         action="store_true",
-        help="Load embedding model immediately instead of on first use"
+        help="Load embedding model immediately instead of on first use",
     )
     parser.add_argument(
         "--store", choices=["memory", "disk"], default="memory", help="Index store mode"
     )
     parser.add_argument("--store-path", default=None, help="Store path (required for --store=disk)")
     parser.add_argument(
-        "--max-get-bytes", type=int, default=80000, help="Default byte cap for docs_get"
+        "--max-get-bytes", type=int, default=80000, help="Default byte cap for document retrieval"
+    )
+    parser.add_argument(
+        "--auto-retrieve-threshold",
+        type=float,
+        default=0.1,
+        help="Default score threshold for auto-retrieval (0-1, default: 0.1)",
+    )
+    parser.add_argument(
+        "--auto-retrieve-limit",
+        type=int,
+        default=5,
+        help="Default max number of docs to auto-retrieve (default: 5)",
+    )
+    parser.add_argument(
+        "--no-snippets", action="store_true", help="Disable content snippets in search results"
     )
     return parser.parse_args()
 
@@ -838,6 +997,9 @@ async def managed_resources(
     store_path: str | None,
     max_get_bytes: int,
     lazy_embed: bool = False,
+    auto_retrieve_threshold: float = 0.1,
+    auto_retrieve_limit: int = 5,
+    include_snippets: bool = True,
 ):
     """Async context manager for managing all server resources."""
     # Validate and store URLs
@@ -856,6 +1018,9 @@ async def managed_resources(
     default_max_get_bytes_var.set(max_get_bytes)
     store_mode_var.set(store)
     store_path_var.set(store_path)
+    auto_retrieve_threshold_var.set(auto_retrieve_threshold)
+    auto_retrieve_limit_var.set(auto_retrieve_limit)
+    include_snippets_var.set(include_snippets)
 
     # Initialize HTTP client
     http_client = httpx.AsyncClient(
@@ -869,7 +1034,7 @@ async def managed_resources(
         len(allowed),
         ", ".join(sorted(allowed)),
     )
-    
+
     if lazy_embed:
         logger.info(f"Embedding model ({embed_model}) will load on first use")
         embedding_model = LazyEmbeddingModel(embed_model)
@@ -935,14 +1100,14 @@ async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> Non
     if parallel > 1:
         # Parallel indexing
         semaphore = asyncio.Semaphore(parallel)
-        
+
         async def index_one(url: str, idx: int):
             async with semaphore:
                 logger.info(f"Pre-indexing {url}")
                 await index.maybe_refresh(url, force=True)
                 if ctx:
                     await ctx.report_progress(f"Indexed {idx}/{total}: {url}")
-        
+
         tasks = [index_one(url, i) for i, url in enumerate(allowed_urls, 1)]
         await asyncio.gather(*tasks)
     else:
@@ -963,35 +1128,35 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
     index = get_index_manager()
     if index is None:
         raise RuntimeError("Index manager not initialized")
-    
+
     allowed_urls = get_allowed_urls()
     now = time.time()
     to_index = []
-    
+
     # Check which sources need indexing
     for url in allowed_urls:
         st = index.sources.get(url)
         if not st or (now - st.last_indexed) >= index.ttl_seconds:
             to_index.append(url)
-    
+
     if not to_index:
         logger.info("All sources are fresh, skipping preindex")
         return
-    
+
     logger.info(f"Smart preindex: {len(to_index)}/{len(allowed_urls)} sources need updating")
     start = time.time()
-    
+
     if parallel > 1:
         # Parallel indexing
         semaphore = asyncio.Semaphore(parallel)
-        
+
         async def index_one(url: str, idx: int):
             async with semaphore:
                 logger.info(f"Indexing stale source: {url}")
                 await index.maybe_refresh(url, force=True)
                 if ctx:
                     await ctx.report_progress(f"Updated {idx}/{len(to_index)}: {url}")
-        
+
         tasks = [index_one(url, i) for i, url in enumerate(to_index, 1)]
         await asyncio.gather(*tasks)
     else:
@@ -1001,7 +1166,7 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
                 await ctx.report_progress(f"Updating {i}/{len(to_index)}: {url}")
             logger.info(f"Indexing stale source: {url}")
             await index.maybe_refresh(url, force=True)
-    
+
     if ctx:
         await ctx.report_progress("Smart preindex complete")
     logger.info("Smart preindex complete in %.2fs", time.time() - start)
@@ -1009,7 +1174,7 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
 
 def main() -> None:
     args = parse_args()
-    
+
     # Merge positional and flag sources
     urls: list[str] = []
     if args.sources:
@@ -1026,7 +1191,7 @@ def main() -> None:
         lazy_embed = not args.no_lazy_embed
         smart_preindex = not args.no_smart_preindex
         background_preindex = not args.no_background_preindex
-        
+
         async with managed_resources(
             urls=urls,
             ttl=ttl_seconds,
@@ -1036,10 +1201,13 @@ def main() -> None:
             store_path=args.store_path,
             max_get_bytes=args.max_get_bytes,
             lazy_embed=lazy_embed,
+            auto_retrieve_threshold=args.auto_retrieve_threshold,
+            auto_retrieve_limit=args.auto_retrieve_limit,
+            include_snippets=not args.no_snippets,
         ):
             # Handle preindexing based on flags
             preindex_task = None
-            
+
             if background_preindex and args.preindex:
                 # Start preindexing in background
                 if smart_preindex:

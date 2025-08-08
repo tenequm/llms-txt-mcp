@@ -8,9 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from llms_txt_mcp.server import (
-    docs_get,
+    docs_query,
     docs_refresh,
-    docs_search,
     docs_sources,
     managed_resources,
     mcp,
@@ -300,17 +299,28 @@ class TestMCPTools:
         assert isinstance(sources, list)
 
     async def test_search_and_get(self, server_setup):
-        """Test search followed by get."""
-        results = await docs_search(query="Section 1", hosts=["example.com"], limit=3)
-        assert isinstance(results, list)
-        if results:
-            # Results are now SearchResult Pydantic models
-            ids = [results[0].id]
-            got = await docs_get(ids=ids, max_bytes=2000, merge=False)
-            # Got is now either MergedContent or SeparateContent model
-            assert hasattr(got, "merged")
-            assert got.merged is False
-            assert hasattr(got, "items")
+        """Test search and retrieval using docs_query."""
+        result = await docs_query(
+            query="Section 1",
+            hosts=["example.com"],
+            limit=3,
+            auto_retrieve=True,
+            auto_retrieve_threshold=None,
+            auto_retrieve_limit=None,
+            retrieve_ids=None,
+            max_bytes=None,
+            merge=False
+        )
+        assert hasattr(result, "search_results")
+        assert hasattr(result, "retrieved_content")
+        assert hasattr(result, "metadata")
+
+        # Check that we got search results
+        assert isinstance(result.search_results, list)
+
+        # If auto-retrieve worked, we should have retrieved content
+        if result.metadata.auto_retrieved_count > 0:
+            assert len(result.retrieved_content) > 0
 
     async def test_refresh(self, server_setup):
         """Test manual refresh."""
@@ -321,31 +331,43 @@ class TestMCPTools:
         assert isinstance(out.refreshed, list)
 
     async def test_docs_get_with_merge(self, server_setup):
-        """Test docs_get with merge=True parameter."""
-        # First do a search to get some IDs
-        results = await docs_search(query="Section", hosts=None, limit=3)
-        assert isinstance(results, list)
+        """Test docs_query with merge=True parameter."""
+        # Use docs_query to search and get multiple sections
+        result = await docs_query(
+            query="Section",
+            hosts=None,
+            limit=3,
+            auto_retrieve=True,
+            auto_retrieve_threshold=None,
+            auto_retrieve_limit=None,
+            retrieve_ids=None,
+            max_bytes=None,
+            merge=True
+        )
+        assert hasattr(result, "search_results")
+        assert hasattr(result, "merged_content")
+        assert isinstance(result.search_results, list)
 
-        if len(results) >= 2:
-            # Get multiple sections with merge=True
-            ids = [results[0].id, results[1].id]
-            merged = await docs_get(ids=ids, max_bytes=5000, merge=True)
-
-            # merged is now MergedContent model
-            assert hasattr(merged, "merged")
-            assert merged.merged is True
-            assert hasattr(merged, "content")
-            assert isinstance(merged.content, str)
-            assert len(merged.content) > 0
+        if result.metadata.auto_retrieved_count >= 2:
+            # Check that merged content was returned
+            assert isinstance(result.merged_content, str)
+            assert len(result.merged_content) > 0
 
             # Also test with merge=False for comparison
-            not_merged = await docs_get(ids=ids, max_bytes=5000, merge=False)
-            assert hasattr(not_merged, "merged")
-            assert not_merged.merged is False
-            assert hasattr(not_merged, "items")
-            if "items" in not_merged:
-                assert isinstance(not_merged["items"], list)
-                assert len(not_merged["items"]) <= len(ids)
+            result_no_merge = await docs_query(
+                query="Section",
+                hosts=None,
+                limit=3,
+                auto_retrieve=True,
+                auto_retrieve_threshold=None,
+                auto_retrieve_limit=None,
+                retrieve_ids=None,
+                max_bytes=None,
+                merge=False
+            )
+            # Should have retrieved content as separate items
+            assert len(result_no_merge.retrieved_content) > 0
+            assert result_no_merge.merged_content == ""  # No merged content when merge=False
 
 
 @pytest.mark.performance
