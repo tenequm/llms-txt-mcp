@@ -1,3 +1,5 @@
-"""MCP server for processing and serving llms.txt files."""
+"""llms-txt-mcp package."""
 
-__version__ = "0.1.0"
+__all__ = [
+    "server",
+]

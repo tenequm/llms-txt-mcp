@@ -1,4 +1,4 @@
-# Plan 1: docs-mcp (Lean Documentation MCP)
+# Plan 1: llms-txt-mcp (Lean Documentation MCP)
 *Fast, predictable, minimal‑context documentation access for Claude Code via llms.txt, with URL‑only config, human‑readable IDs, and freshness under your control.*
 
 ## Problem Statement
@@ -95,7 +95,7 @@ else parse official headings -> H2 sections (H1 fallback)
 - [ ] Indexing AI SDK `llms.txt` completes and `docCount>0`.
 
 **Success Criteria:**
-- [ ] `uv run docs-mcp --sources https://ai-sdk.dev/llms.txt --preindex` produces working tools.
+- [ ] `uv run llms-txt-mcp --sources https://ai-sdk.dev/llms.txt --preindex` produces working tools.
 - [ ] Search p95 <150ms (local, indexed); `docs_get` p95 <50ms single section.
 - [ ] Schemas stay small and deterministic.
 
