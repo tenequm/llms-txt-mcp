@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 llms-txt-mcp = "llms_txt_mcp.server:main"
+llms-txt-mcp-dev = "llms_txt_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -62,3 +63,4 @@ asyncio_mode = "auto"
 markers = [
     "performance: marks tests as performance tests (may be slower)"
 ]
+

@@ -9,15 +9,15 @@ def pytest_terminal_summary(terminalreporter, exitstatus):
         passed = len(terminalreporter.stats.get("passed", []))
         failed = len(terminalreporter.stats.get("failed", []))
 
-        print("\n📊 llms-txt-mcp Test Results:")
-        print(f"   ✅ {passed} tests passed")
+        print("\nllms-txt-mcp Test Results:")
+        print(f"   {passed} tests passed")
         if failed > 0:
-            print(f"   ❌ {failed} tests failed")
+            print(f"   {failed} tests failed")
         else:
-            print("   🚀 All performance claims validated")
-            print("   🔒 Security controls working")
-            print("   💾 Caching system verified")
-            print("   📄 README motivation claims proven")
+            print("   All performance claims validated")
+            print("   Security controls working")
+            print("   Caching system verified")
+            print("   README claims proven")
 
 
 def pytest_configure(config):

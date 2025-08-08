@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MCP SDK 1.12+](https://img.shields.io/badge/MCP%20SDK-1.12+-purple.svg)](https://github.com/modelcontextprotocol/python-sdk)
 
-**Lightning-fast documentation access for Claude Code. No more timeouts. No more context pollution.**
+Fast documentation access for Claude Code via llms.txt parsing.
 
 ## The Problem
 
@@ -22,7 +22,7 @@ You're not alone. This is mcpdoc failing on AI SDK documentation.
 - ❌ **Timeouts** on files like AI SDK's 30K+ line llms.txt
 - 🗑️ **Context pollution** - your conversation drowns in documentation dumps
 
-**The breaking point:** AI SDK's documentation ([ai-sdk.dev/llms.txt](https://ai-sdk.dev/llms.txt)) literally breaks mcpdoc, forcing Claude Code to fall back to inferior tools.
+AI SDK's documentation ([ai-sdk.dev/llms.txt](https://ai-sdk.dev/llms.txt)) breaks mcpdoc due to size.
 
 ## The Problem in Action
 
@@ -37,7 +37,7 @@ Here's what happens when you try to get AI SDK documentation for building a chat
     allowed tokens (25,000). Please use pagination, filtering, or limit 
     parameters to reduce the response size.
 ```
-**Result:** 💥 **251,431 tokens** attempted → Complete failure
+**Result:** 251,431 tokens attempted → Complete failure
 
 ### Context7: Drowning in Noise
 ```
@@ -46,37 +46,35 @@ Here's what happens when you try to get AI SDK documentation for building a chat
     ========================
     … +2380 lines (ctrl+r to expand)
 ```
-**Result:** 😵 **15,000 tokens** of "overbloated stuff" → Context pollution
+**Result:** 15,000 tokens of context pollution
 
-### llms-txt-mcp: Just What You Need
+### llms-txt-mcp
 ```
 > Search for "chatbot" in AI SDK docs
 ⏺ docs_search(query: "chatbot", limit: 5)
   ⎿ Found 5 relevant sections (47 tokens)
 ```
-**Result:** ✅ **<100 tokens** → Clean, focused results
+**Result:** <100 tokens
 
 ## Why This Exists
 
-I built this after watching mcpdoc fail with a quarter-million token response on AI SDK docs. Context7 "worked" but buried me in 15,000 tokens of noise when I just wanted to know how to build a chatbot. I needed something that actually worked with Claude Code.
+Built to solve the problem of large documentation files timing out or consuming excessive tokens.
 
-## The Solution
+## Solution
 
-**llms-txt-mcp:** Built for speed. Built for Claude Code. Built for real documentation.
+| Operation | mcpdoc | Context7 | llms-txt-mcp |
+|-----------|--------|----------|--------------|
+| AI SDK Chatbot Docs | 251,431 tokens → ERROR | 15,000 tokens | <100 tokens |
+| Structure Discovery | 5+ seconds | 2-3 seconds | <200ms |
+| Context Usage | Fails completely | 15K tokens | 50 tokens |
+| Large File Support | Timeouts | Truncates | Streams |
+| AI SDK llms.txt (30K+ lines) | Fails | Partial | 132 sections |
 
-| Operation | mcpdoc | Context7 | llms-txt-mcp | **Improvement** |
-|-----------|--------|----------|--------------|-----------------|
-| AI SDK Chatbot Docs | ❌ 251,431 tokens → ERROR | 😵 15,000 tokens | ✅ <100 tokens | **2,500x-5,000x smaller** |
-| Structure Discovery | 5+ seconds | 2-3 seconds | <200ms | **25x+ faster** |
-| Context Usage | Fails completely | 15K tokens | 50 tokens | **300x smaller** |
-| Large File Support | ❌ Timeouts | ⚠️ Truncates | ✅ Streams | **∞** |
-| AI SDK llms.txt (30K+ lines) | ❌ Fails | ⚠️ Partial | ✅ 132 sections | **Works** |
-
-### Visual Token Comparison
+### Token Usage
 ```
-mcpdoc:     [████████████████████████████████] 251K tokens → 💥 ERROR
-Context7:   [████████████████] 15K tokens → 😵 Drowning in noise
-llms-txt:   [▪] <100 tokens → ✅ Perfect
+mcpdoc:     [████████████████████████████████] 251K tokens → ERROR
+Context7:   [████████████████] 15K tokens 
+llms-txt:   [▪] <100 tokens
 ```
 
 ## Quick Start
@@ -214,8 +212,8 @@ uvx llms-txt-mcp https://ai-sdk.dev/llms.txt \
 
 ### Advanced Flags
 - `--parallel-preindex N` - Index N sources concurrently (default: 3)
-- `--max-get-bytes N` - Byte limit for responses (default: 80000) (80,000 bytes ≈ 20,000 tokens (at ~4 chars/token))
-- `--embed-model MODEL` - Change embedding model (default: all-MiniLM-L6-v2)
+- `--max-get-bytes N` - Byte limit for responses (default: 70000)
+- `--embed-model MODEL` - Change embedding model (default: BAAI/bge-small-en-v1.5)
 - `--no-lazy-embed` - Load model immediately
 - `--no-smart-preindex` - Always reindex everything
 - `--no-background-preindex` - Wait for indexing to complete
@@ -235,10 +233,10 @@ uvx llms-txt-mcp https://ai-sdk.dev/llms.txt \
 
 **Test Results:**
 ```
-✅ 18 tests passing
-🚀 25x+ faster structure discovery verified
-📦 30x smaller context usage confirmed
-🔥 Handles 30K+ line files without breaking
+18 tests passing
+25x+ faster structure discovery verified
+30x smaller context usage confirmed
+Handles 30K+ line files without breaking
 ```
 
 ## When to Use What
@@ -258,16 +256,34 @@ cd llms-txt-mcp
 uv sync --all-extras
 ```
 
-### Test
+### Development Workflow
 ```bash
-uv run pytest           # Run tests
-uv run ruff format .    # Format code
-uv run mypy src/        # Type check
+# Run the tool
+uv run llms-txt-mcp-dev --version
+
+# Run from anywhere
+uv run --directory /path/to/llms-txt-mcp llms-txt-mcp-dev --version
+
+# Development commands
+uv run pytest                    # Run tests
+uv run ruff check .             # Check code quality  
+uv run ruff format .            # Format code
+uv run mypy src/                # Type check
+
+# With arguments
+uv run llms-txt-mcp-dev https://ai-sdk.dev/llms.txt --preindex
+```
+
+### Shell Integration
+```bash
+llms-dev() {
+    uv run --directory /path/to/llms-txt-mcp llms-txt-mcp-dev "$@"
+}
 ```
 
 ### Local Testing with Inspector
 ```bash
-npx @modelcontextprotocol/inspector uv run llms-txt-mcp https://ai-sdk.dev/llms.txt
+npx @modelcontextprotocol/inspector uv run llms-txt-mcp-dev https://ai-sdk.dev/llms.txt
 ```
 
 ## Architecture
@@ -300,5 +316,3 @@ Built on [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and the [
 MIT - See [LICENSE](LICENSE)
 
 ---
-
-*Built to solve real problems. No bloat. No complexity. Just fast documentation access.*

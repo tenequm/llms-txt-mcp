@@ -37,6 +37,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+try:
+    from importlib.metadata import version
+    __version__ = version("llms-txt-mcp")
+except ImportError:
+    # Fallback for development/editable installs
+    __version__ = "0.1.0-dev"
+
 import chromadb
 import httpx
 import yaml
@@ -665,7 +672,7 @@ class IndexManager:
         )
 
     def search(
-        self, query: str, hosts: list[str] | None, limit: int, include_snippets: bool = True
+        self, query: str, limit: int, include_snippets: bool = True
     ) -> list[dict[str, Any]]:
         collection = self.ensure_collection()
         embedding_model = get_embedding_model()
@@ -685,8 +692,6 @@ class IndexManager:
         query_terms = query.split() if include_snippets else []
 
         for meta, dist in zip(metas, dists):
-            if hosts and meta.get("host") not in hosts:
-                continue
             score = max(0.0, 1.0 - float(dist))
 
             # Extract snippet if requested
@@ -824,7 +829,6 @@ async def docs_refresh(
 @mcp.tool()
 async def docs_query(
     query: str = Field(description="Search query text"),
-    hosts: list[str] | None = Field(default=None, description="Filter results by host domains"),
     limit: int = Field(default=10, description="Maximum number of search results"),
     auto_retrieve: bool = Field(default=True, description="Auto-retrieve top relevant results"),
     auto_retrieve_threshold: float | None = Field(
@@ -863,7 +867,7 @@ async def docs_query(
 
     # Perform search
     search_results = index.search(
-        query=query, hosts=hosts, limit=limit, include_snippets=include_snippets
+        query=query, limit=limit, include_snippets=include_snippets
     )
 
     # Parse query for interpretation
@@ -933,6 +937,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="llms-txt-mcp", description="Lean Documentation MCP via llms.txt"
     )
+    parser.add_argument(
+        "--version", "-v",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
     parser.add_argument("sources", nargs="*", help="llms.txt URLs to index (positional)")
     parser.add_argument("--sources", dest="sources_flag", nargs="*", help="llms.txt URLs to index")
     parser.add_argument("--ttl", default="24h", help="Refresh cadence (e.g., 30m, 24h)")
@@ -967,7 +976,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--store-path", default=None, help="Store path (required for --store=disk)")
     parser.add_argument(
-        "--max-get-bytes", type=int, default=80000, help="Default byte cap for document retrieval"
+        "--max-get-bytes", type=int, default=70000, help="Default byte cap for document retrieval"
     )
     parser.add_argument(
         "--auto-retrieve-threshold",

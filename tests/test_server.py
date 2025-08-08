@@ -302,7 +302,6 @@ class TestMCPTools:
         """Test search and retrieval using docs_query."""
         result = await docs_query(
             query="Section 1",
-            hosts=["example.com"],
             limit=3,
             auto_retrieve=True,
             auto_retrieve_threshold=None,
@@ -335,7 +334,6 @@ class TestMCPTools:
         # Use docs_query to search and get multiple sections
         result = await docs_query(
             query="Section",
-            hosts=None,
             limit=3,
             auto_retrieve=True,
             auto_retrieve_threshold=None,
@@ -356,7 +354,6 @@ class TestMCPTools:
             # Also test with merge=False for comparison
             result_no_merge = await docs_query(
                 query="Section",
-                hosts=None,
                 limit=3,
                 auto_retrieve=True,
                 auto_retrieve_threshold=None,
