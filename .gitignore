@@ -47,9 +47,5 @@ dmypy.json
 # Logs
 *.log
 
-# MCP
-.mcp.json
-mcp-config.json
-
 # Other
 .claude/settings.local.json

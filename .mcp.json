@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gitmcp": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://gitmcp.io/docs"]
+    },
+    "Context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  }
+}
