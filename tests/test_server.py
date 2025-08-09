@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from llms_txt_mcp.server import (
+from src.server import (
     docs_query,
     docs_refresh,
     docs_sources,
@@ -82,7 +82,7 @@ Content 2
 @pytest.fixture
 async def server_setup(mock_http_client):
     """Setup server for async tests with mocked HTTP."""
-    import llms_txt_mcp.server as server_mod
+    import src.server as server_mod
 
     # Stub embedding class BEFORE init to avoid model download
     class _FakeEmb:
@@ -111,20 +111,30 @@ async def server_setup(mock_http_client):
 
     server_mod.SentenceTransformer = _FakeSentenceTransformer  # type: ignore[attr-defined]
 
+    from src.server import Config
+
     test_urls = ["https://example.com/llms.txt"]
 
-    # Use the new managed_resources context manager
-    async with managed_resources(
-        urls=test_urls,
-        ttl=0,
+    # Create config for tests
+    test_config = Config(
+        allowed_urls=set(test_urls),
+        ttl_seconds=0,
         timeout=30,
-        embed_model="thenlper/gte-small",
-        store="memory",
+        embed_model_name="thenlper/gte-small",
+        store_mode="memory",
         store_path=None,
         max_get_bytes=60000,
-    ):
-        # Replace HTTP client with mock using context variable
-        server_mod.http_client_var.set(mock_http_client)
+        auto_retrieve_threshold=0.1,
+        auto_retrieve_limit=5,
+        include_snippets=True,
+        preindex=False,
+        background_preindex=False,
+    )
+
+    # Use the new managed_resources context manager
+    async with managed_resources(test_config):
+        # Replace HTTP client with mock
+        server_mod.http_client = mock_http_client
 
         yield
 
@@ -227,7 +237,7 @@ class TestPerformanceClaims:
         )
 
         # Should parse without errors
-        from llms_txt_mcp.parsers import parse_llms_txt
+        from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
         sections = result["docs"]
@@ -236,7 +246,7 @@ class TestPerformanceClaims:
     def test_fast_structure_discovery(self, large_content):
         """Test fast structure discovery (<1000ms)."""
         start_time = time.time()
-        from llms_txt_mcp.parsers import parse_llms_txt
+        from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
         sections = result["docs"]
@@ -249,7 +259,7 @@ class TestPerformanceClaims:
 
     def test_clean_context_windows(self, large_content):
         """Test that structure responses are much smaller than full content."""
-        from llms_txt_mcp.parsers import parse_llms_txt
+        from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
         secs = result["docs"]
@@ -265,7 +275,7 @@ class TestPerformanceClaims:
 
     def test_surgical_section_extraction(self, large_content):
         """Test precise section extraction."""
-        from llms_txt_mcp.parsers import parse_llms_txt
+        from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
         secs = result["docs"]

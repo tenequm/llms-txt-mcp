@@ -35,7 +35,6 @@ import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -55,7 +54,7 @@ from mcp.server.fastmcp.server import Context
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
-from .parsers import parse_llms_txt
+from .parser import parse_llms_txt
 
 try:
     # Chroma telemetry settings (0.5+)
@@ -77,6 +76,24 @@ logger = logging.getLogger("llms-txt-mcp")
 
 
 @dataclass
+class Config:
+    """Server configuration."""
+
+    allowed_urls: set[str]
+    ttl_seconds: int
+    timeout: int
+    embed_model_name: str
+    store_mode: str
+    store_path: str | None
+    max_get_bytes: int
+    auto_retrieve_threshold: float
+    auto_retrieve_limit: int
+    include_snippets: bool
+    preindex: bool
+    background_preindex: bool
+
+
+@dataclass
 class SourceState:
     source_url: str
     host: str
@@ -84,7 +101,6 @@ class SourceState:
     last_modified: str | None
     last_indexed: float
     doc_count: int
-    format_type: str | None = None  # Track detected format
     actual_url: str | None = None  # Track if auto-upgraded to llms-full.txt
 
 
@@ -132,67 +148,28 @@ class RefreshResult(BaseModel):
 
 
 class QueryResult(BaseModel):
-    """Combined search and retrieval result with metadata."""
+    """Combined search and retrieval result."""
 
     search_results: list[SearchResult] = Field(description="Search results with scores")
     retrieved_content: dict[str, DocContent] = Field(
         default_factory=dict, description="Auto-retrieved document contents"
     )
     merged_content: str = Field(default="", description="Merged content if merge=true")
-    # Metadata fields merged directly
     auto_retrieved_count: int = Field(default=0, description="Number of documents auto-retrieved")
     total_results: int = Field(default=0, description="Total search results found")
 
 
 # -------------------------
-# Lazy Loading Support
+# Global state management
 # -------------------------
 
-
-class LazyEmbeddingModel:
-    """Loads embedding model only when first needed."""
-
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-        self._model: SentenceTransformer | None = None
-
-    def get(self) -> SentenceTransformer:
-        if self._model is None:
-            logger.info(f"Loading embedding model on first use: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name)
-        return self._model
-
-    def encode(self, texts):
-        """Forward encode calls to the actual model."""
-        return self.get().encode(texts)
-
-
-# -------------------------
-# Context variables for state management
-# -------------------------
-
-
-# Initialize context variables
-allowed_urls_var: ContextVar[set[str]] = ContextVar("allowed_urls", default=set())
-http_client_var: ContextVar[httpx.AsyncClient | None] = ContextVar("http_client", default=None)
-embedding_model_var: ContextVar[LazyEmbeddingModel | SentenceTransformer | None] = ContextVar(
-    "embedding_model", default=None
-)
-chroma_client_var: ContextVar[chromadb.Client | None] = ContextVar("chroma_client", default=None)
-chroma_collection_var: ContextVar[chromadb.Collection | None] = ContextVar(
-    "chroma_collection", default=None
-)
-ttl_seconds_var: ContextVar[int] = ContextVar("ttl_seconds", default=24 * 3600)
-default_max_get_bytes_var: ContextVar[int] = ContextVar("default_max_get_bytes", default=60000)
-store_mode_var: ContextVar[str] = ContextVar("store_mode", default="memory")
-store_path_var: ContextVar[str | None] = ContextVar("store_path", default=None)
-index_manager_var: ContextVar[IndexManager | None] = ContextVar("index_manager", default=None)
-auto_retrieve_threshold_var: ContextVar[float] = ContextVar("auto_retrieve_threshold", default=0.1)
-auto_retrieve_limit_var: ContextVar[int] = ContextVar("auto_retrieve_limit", default=5)
-include_snippets_var: ContextVar[bool] = ContextVar("include_snippets", default=True)
-
-
-# No getter functions needed - use var.get() directly
+# Global state variables - initialized during startup
+config: Config | None = None
+http_client: httpx.AsyncClient | None = None
+embedding_model: SentenceTransformer | None = None
+chroma_client: chromadb.Client | None = None
+chroma_collection: chromadb.Collection | None = None
+index_manager: IndexManager | None = None
 
 
 # -------------------------
@@ -304,8 +281,7 @@ class IndexManager:
         self.sources: dict[str, SourceState] = {}
 
     def ensure_collection(self) -> chromadb.Collection:
-        chroma_client = chroma_client_var.get()
-        chroma_collection = chroma_collection_var.get()
+        global chroma_client, chroma_collection
 
         if chroma_client is None:
             raise RuntimeError("Chroma client not initialized")
@@ -315,7 +291,6 @@ class IndexManager:
                 metadata={"purpose": "llms-txt-mcp"},
                 embedding_function=None,
             )
-            chroma_collection_var.set(chroma_collection)
         return chroma_collection
 
     async def maybe_refresh(self, source_url: str, force: bool = False) -> None:
@@ -328,7 +303,7 @@ class IndexManager:
     async def _stream_lines(
         self, url: str, headers: dict[str, str]
     ) -> tuple[AsyncIterator[str], dict[str, str]]:
-        http_client = http_client_var.get()
+        global http_client
         if http_client is None:
             raise RuntimeError("HTTP client not initialized")
 
@@ -425,7 +400,6 @@ class IndexManager:
                     hdrs.get("ETag"),
                     hdrs.get("Last-Modified"),
                     try_url,
-                    format_type,
                 )
 
             except Exception as e:
@@ -445,7 +419,6 @@ class IndexManager:
                 etag,
                 last_mod,
                 actual_url,
-                format_type,
             ) = await self._fetch_and_parse_sections(
                 source_url, prior.etag if prior else None, prior.last_modified if prior else None
             )
@@ -466,7 +439,7 @@ class IndexManager:
         host = host_of(source_url)
         collection = self.ensure_collection()
 
-        embedding_model = embedding_model_var.get()
+        global embedding_model
         if embedding_model is None:
             raise RuntimeError("Embedding model not initialized")
 
@@ -541,7 +514,6 @@ class IndexManager:
             last_modified=last_mod,
             last_indexed=time.time(),
             doc_count=len(ids),
-            format_type=format_type,
             actual_url=actual_url,
         )
 
@@ -562,14 +534,16 @@ class IndexManager:
         else:
             logger.warning(f"No sections found in {source_url}")
 
-    def search(self, query: str, limit: int, include_snippets: bool = True) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int, include_snippets: bool = True) -> list[SearchResult]:
         collection = self.ensure_collection()
-        embedding_model = embedding_model_var.get()
+        global embedding_model, config
         if embedding_model is None:
             raise RuntimeError("Embedding model not initialized")
+        if config is None:
+            raise RuntimeError("Config not initialized")
 
         # Build list of valid source URLs (including actual URLs from redirects)
-        allowed_urls = allowed_urls_var.get()
+        allowed_urls = config.allowed_urls
 
         query_embedding = embedding_model.encode([query]).tolist()
 
@@ -586,7 +560,7 @@ class IndexManager:
             },
             include=["metadatas", "distances"],
         )  # type: ignore[arg-type]
-        items: list[dict[str, Any]] = []
+        items: list[SearchResult] = []
         metas = res.get("metadatas", [[]])[0]
         dists = res.get("distances", [[]])[0]
 
@@ -603,21 +577,23 @@ class IndexManager:
                 snippet = extract_snippet(content, query_terms)
 
             items.append(
-                {
-                    "id": meta.get("id"),
-                    "source": meta.get("source"),
-                    "title": meta.get("title"),
-                    "description": meta.get("description", ""),
-                    "score": round(score, 3),
-                    "auto_retrieved": False,  # Will be set by caller
-                    "snippet": snippet,
-                }
+                SearchResult(
+                    id=meta.get("id", ""),
+                    source=meta.get("source", ""),
+                    title=meta.get("title", ""),
+                    description=meta.get("description", ""),
+                    score=round(score, 3),
+                    auto_retrieved=False,  # Will be set by caller
+                    snippet=snippet,
+                )
             )
             if len(items) >= limit:
                 break
         return items
 
-    def get(self, ids: list[str], max_bytes: int | None, merge: bool) -> dict[str, Any]:
+    def get(
+        self, ids: list[str], max_bytes: int | None, merge: bool
+    ) -> dict[str, Any] | list[DocContent]:
         collection = self.ensure_collection()
         max_budget = int(max_bytes) if max_bytes is not None else self.max_get_bytes
         results: list[dict[str, Any]] = []
@@ -670,7 +646,10 @@ class IndexManager:
         Returns the number of documents cleaned up.
         """
         collection = self.ensure_collection()
-        allowed_urls = allowed_urls_var.get()
+        global config
+        if config is None:
+            raise RuntimeError("Config not initialized")
+        allowed_urls = config.allowed_urls
         ttl_seconds = self.ttl_seconds
         now = time.time()
 
@@ -721,15 +700,15 @@ class IndexManager:
 
 
 # -------------------------
-# Tools
+# Resources
 # -------------------------
 
 
-@mcp.tool()
-async def docs_sources() -> list[SourceInfo]:
-    """List indexed documentation sources."""
-    index = index_manager_var.get()
-    if index is None:
+@mcp.resource("resource://sources")
+async def get_sources() -> list[SourceInfo]:
+    """Get list of all indexed documentation sources."""
+    global index_manager
+    if index_manager is None:
         return []
 
     return [
@@ -739,7 +718,30 @@ async def docs_sources() -> list[SourceInfo]:
             lastIndexed=int(st.last_indexed),
             docCount=st.doc_count,
         )
-        for st in index.sources.values()
+        for st in index_manager.sources.values()
+    ]
+
+
+# -------------------------
+# Tools
+# -------------------------
+
+
+@mcp.tool()
+async def docs_sources() -> list[SourceInfo]:
+    """List indexed documentation sources."""
+    global index_manager
+    if index_manager is None:
+        return []
+
+    return [
+        SourceInfo(
+            source_url=st.source_url,
+            host=st.host,
+            lastIndexed=int(st.last_indexed),
+            docCount=st.doc_count,
+        )
+        for st in index_manager.sources.values()
     ]
 
 
@@ -751,26 +753,26 @@ async def docs_refresh(
     ctx: Context | None = None,
 ) -> RefreshResult:
     """Force refresh cached documentation."""
-    index = index_manager_var.get()
-    if index is None:
+    global index_manager, config
+    if index_manager is None or config is None:
         raise RuntimeError("Server not initialized")
 
     refreshed: list[str] = []
-    allowed_urls = allowed_urls_var.get()
+    allowed_urls = config.allowed_urls
 
     if source:
         if source not in allowed_urls:
             raise ValueError("Source not allowed")
         if ctx:
             await ctx.report_progress(f"Refreshing {source}...")
-        await index.maybe_refresh(source, force=True)
+        await index_manager.maybe_refresh(source, force=True)
         refreshed.append(source)
     else:
         total = len(allowed_urls)
         for i, url in enumerate(list(allowed_urls), 1):
             if ctx:
                 await ctx.report_progress(f"Refreshing source {i}/{total}: {url}")
-            await index.maybe_refresh(url, force=True)
+            await index_manager.maybe_refresh(url, force=True)
             refreshed.append(url)
 
     if ctx:
@@ -778,7 +780,9 @@ async def docs_refresh(
 
     return RefreshResult(
         refreshed=refreshed,
-        counts={u: index.sources[u].doc_count for u in refreshed if u in index.sources},
+        counts={
+            u: index_manager.sources[u].doc_count for u in refreshed if u in index_manager.sources
+        },
     )
 
 
@@ -802,27 +806,29 @@ async def docs_query(
     ),
 ) -> QueryResult:
     """Search documentation with optional auto-retrieval. Combines search + get functionality."""
-    index = index_manager_var.get()
-    if index is None:
+    global index_manager, config
+    if index_manager is None or config is None:
         raise RuntimeError("Server not initialized")
 
     # Use defaults from config if not provided
     threshold = (
         auto_retrieve_threshold
         if auto_retrieve_threshold is not None
-        else auto_retrieve_threshold_var.get()
+        else config.auto_retrieve_threshold
     )
     retrieve_limit = (
-        auto_retrieve_limit if auto_retrieve_limit is not None else auto_retrieve_limit_var.get()
+        auto_retrieve_limit if auto_retrieve_limit is not None else config.auto_retrieve_limit
     )
-    include_snippets = include_snippets_var.get()
+    include_snippets = config.include_snippets
 
     # Refresh stale sources
-    for url in list(allowed_urls_var.get()):
-        await index.maybe_refresh(url)
+    for url in list(config.allowed_urls):
+        await index_manager.maybe_refresh(url)
 
     # Perform search
-    search_results = index.search(query=query, limit=limit, include_snippets=include_snippets)
+    search_results = index_manager.search(
+        query=query, limit=limit, include_snippets=include_snippets
+    )
 
     # Determine which IDs to retrieve
     ids_to_retrieve: list[str] = []
@@ -835,27 +841,33 @@ async def docs_query(
     if auto_retrieve:
         # Auto-retrieve based on score threshold
         for result in search_results[:retrieve_limit]:
-            if result["score"] >= threshold:
-                if result["id"] not in ids_to_retrieve:
-                    ids_to_retrieve.append(result["id"])
+            if result.score >= threshold:
+                if result.id not in ids_to_retrieve:
+                    ids_to_retrieve.append(result.id)
                     auto_retrieved_count += 1
                 # Mark as auto-retrieved
-                result["auto_retrieved"] = True
+                result.auto_retrieved = True
 
     # Retrieve content
     retrieved_content: dict[str, DocContent] = {}
     merged_content = ""
 
     if ids_to_retrieve:
-        result = index.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
+        result = index_manager.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
         if merge and result.get("merged"):
             merged_content = result["content"]
         else:
             for item in result.get("items", []):
-                retrieved_content[item["id"]] = DocContent(**item)
+                retrieved_content[item["id"]] = DocContent(
+                    id=item["id"],
+                    source=item["source"],
+                    host=item["host"],
+                    title=item["title"],
+                    content=item["content"],
+                )
 
     return QueryResult(
-        search_results=[SearchResult(**result) for result in search_results],
+        search_results=search_results,
         retrieved_content=retrieved_content,
         merged_content=merged_content,
         auto_retrieved_count=auto_retrieved_count,
@@ -884,25 +896,9 @@ def parse_args() -> argparse.Namespace:
         "--no-preindex", action="store_true", help="Disable automatic pre-indexing on launch"
     )
     parser.add_argument(
-        "--no-smart-preindex",
-        action="store_true",
-        help="Disable smart preindexing (by default only stale sources are indexed)",
-    )
-    parser.add_argument(
-        "--parallel-preindex",
-        type=int,
-        default=3,
-        help="Number of parallel indexing tasks (default: 3)",
-    )
-    parser.add_argument(
         "--no-background-preindex",
         action="store_true",
         help="Disable background preindexing (by default runs in background)",
-    )
-    parser.add_argument(
-        "--no-lazy-embed",
-        action="store_true",
-        help="Load embedding model immediately instead of on first use",
     )
     parser.add_argument(
         "--store",
@@ -937,74 +933,49 @@ def parse_args() -> argparse.Namespace:
 
 
 @asynccontextmanager
-async def managed_resources(
-    urls: list[str],
-    ttl: int,
-    timeout: int,
-    embed_model: str,
-    store: str,
-    store_path: str | None,
-    max_get_bytes: int,
-    lazy_embed: bool = False,
-    auto_retrieve_threshold: float = 0.1,
-    auto_retrieve_limit: int = 5,
-    include_snippets: bool = True,
-):
+async def managed_resources(cfg: Config):
     """Async context manager for managing all server resources."""
-    # Validate and store URLs
-    allowed: set[str] = set()
-    for url in urls:
+    global config, http_client, embedding_model, chroma_client, chroma_collection, index_manager
+
+    # Validate URLs
+    for url in cfg.allowed_urls:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"Invalid URL: {url}")
         # Support both llms.txt and llms-full.txt
         if not (url.endswith("/llms.txt") or url.endswith("/llms-full.txt")):
             raise ValueError(f"URL must end with /llms.txt or /llms-full.txt: {url}")
-        allowed.add(url)
 
-    # Set context variables
-    allowed_urls_var.set(allowed)
-    ttl_seconds_var.set(ttl)
-    default_max_get_bytes_var.set(max_get_bytes)
-    store_mode_var.set(store)
-    store_path_var.set(store_path)
-    auto_retrieve_threshold_var.set(auto_retrieve_threshold)
-    auto_retrieve_limit_var.set(auto_retrieve_limit)
-    include_snippets_var.set(include_snippets)
+    # Set global config
+    config = cfg
 
     # Initialize HTTP client
     http_client = httpx.AsyncClient(
-        timeout=timeout,
+        timeout=cfg.timeout,
         follow_redirects=True,
         headers={"User-Agent": f"llms-txt-mcp/{__version__}"},
     )
-    http_client_var.set(http_client)
 
     # Initialize embedding model
     logger.info(
         "Starting llms-txt-mcp with %d source(s): %s",
-        len(allowed),
-        ", ".join(sorted(allowed)),
+        len(cfg.allowed_urls),
+        ", ".join(sorted(cfg.allowed_urls)),
     )
 
-    if lazy_embed:
-        logger.info(f"Embedding model ({embed_model}) will load on first use")
-        embedding_model = LazyEmbeddingModel(embed_model)
-    else:
-        logger.info(f"Loading embedding model: {embed_model}")
-        embedding_model = SentenceTransformer(embed_model)
-    embedding_model_var.set(embedding_model)
+    logger.info(f"Loading embedding model: {cfg.embed_model_name}")
+    embedding_model = SentenceTransformer(cfg.embed_model_name)
 
     # Initialize Chroma
-    if store == "disk":
+    if cfg.store_mode == "disk":
         # store_path is guaranteed to exist when store="disk" due to auto-detection logic
         if ChromaSettings is not None:
             chroma_client = chromadb.PersistentClient(
-                path=store_path, settings=ChromaSettings(anonymized_telemetry=False)
+                path=cfg.store_path, settings=ChromaSettings(anonymized_telemetry=False)
             )
         else:
-            chroma_client = chromadb.PersistentClient(path=store_path)
-        logger.info(f"ChromaDB PersistentClient at {store_path}")
+            chroma_client = chromadb.PersistentClient(path=cfg.store_path)
+        logger.info(f"ChromaDB PersistentClient at {cfg.store_path}")
     else:
         if ChromaSettings is not None:
             chroma_client = chromadb.Client(settings=ChromaSettings(anonymized_telemetry=False))
@@ -1012,14 +983,11 @@ async def managed_resources(
             chroma_client = chromadb.Client()
         logger.info("ChromaDB ephemeral client initialized (telemetry disabled)")
 
-    chroma_client_var.set(chroma_client)
-
     # Initialize index manager
-    index_manager = IndexManager(ttl_seconds=ttl, max_get_bytes=max_get_bytes)
-    index_manager_var.set(index_manager)
+    index_manager = IndexManager(ttl_seconds=cfg.ttl_seconds, max_get_bytes=cfg.max_get_bytes)
 
     # Clean up expired documents from unconfigured sources
-    if store == "disk":
+    if cfg.store_mode == "disk":
         # Only cleanup when using persistent storage
         try:
             cleaned_up = await index_manager.cleanup_expired_documents()
@@ -1041,13 +1009,13 @@ async def managed_resources(
         except Exception as e:
             logger.error(f"Error closing HTTP client: {e}")
 
-        # Clear context variables
-        allowed_urls_var.set(set())
-        http_client_var.set(None)
-        embedding_model_var.set(None)
-        chroma_client_var.set(None)
-        chroma_collection_var.set(None)
-        index_manager_var.set(None)
+        # Clear global state
+        config = None
+        http_client = None
+        embedding_model = None
+        chroma_client = None
+        chroma_collection = None
+        index_manager = None
 
 
 def _display_indexing_summary(index: IndexManager) -> None:
@@ -1060,11 +1028,6 @@ def _display_indexing_summary(index: IndexManager) -> None:
     logger.info("=" * 60)
 
     for source_url, state in index.sources.items():
-        # Format the display based on what we know
-        format_name = "unknown"
-        if state.format_type:
-            format_name = state.format_type.replace("-llms-txt", "").replace("-full", "")
-
         # Check if auto-upgrade happened
         display_url = source_url
         if state.actual_url and state.actual_url != source_url:
@@ -1076,49 +1039,29 @@ def _display_indexing_summary(index: IndexManager) -> None:
             display_url = f"{source_url} → {file_type}"
 
         # Display the summary line
-        logger.info(f"{display_url} | {format_name} | {state.doc_count} sections")
+        logger.info(f"{display_url} | {state.doc_count} sections")
 
     logger.info("=" * 60)
 
 
-async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> None:
+async def preindex_sources() -> None:
     """Pre-index all configured sources."""
-    index = index_manager_var.get()
-    if index is None:
-        raise RuntimeError("Index manager not initialized")
+    global index_manager, config
+    if index_manager is None or config is None:
+        raise RuntimeError("Server not initialized")
 
-    allowed_urls = allowed_urls_var.get()
-    total = len(allowed_urls)
+    total = len(config.allowed_urls)
     start = time.time()
     logger.info("Preindexing %d source(s)...", total)
 
-    if parallel > 1:
-        # Parallel indexing
-        semaphore = asyncio.Semaphore(parallel)
-
-        async def index_one(url: str, idx: int):
-            async with semaphore:
-                logger.info(f"Fetching {url}...")
-                await index.maybe_refresh(url, force=True)
-                if ctx:
-                    await ctx.report_progress(f"Indexed {idx}/{total}: {url}")
-
-        tasks = [index_one(url, i) for i, url in enumerate(allowed_urls, 1)]
-        await asyncio.gather(*tasks)
-    else:
-        # Sequential indexing
-        for i, url in enumerate(list(allowed_urls), 1):
-            if ctx:
-                await ctx.report_progress(f"Pre-indexing source {i}/{total}: {url}")
-            logger.info(f"Fetching {url}...")
-            await index.maybe_refresh(url, force=True)
+    # Simple sequential indexing
+    for i, url in enumerate(config.allowed_urls, 1):
+        logger.info(f"Fetching {url} ({i}/{total})...")
+        await index_manager.maybe_refresh(url, force=True)
 
     # Calculate total documents indexed
-    total_docs = sum(st.doc_count for st in index.sources.values())
-    indexed_count = len([st for st in index.sources.values() if st.doc_count > 0])
-
-    if ctx:
-        await ctx.report_progress("Pre-indexing complete")
+    total_docs = sum(st.doc_count for st in index_manager.sources.values())
+    indexed_count = len([st for st in index_manager.sources.values() if st.doc_count > 0])
 
     logger.info(
         "Indexing complete: %d sections from %d/%d sources (%.1fs)",
@@ -1129,69 +1072,7 @@ async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> Non
     )
 
     # Display summary table
-    _display_indexing_summary(index)
-
-
-async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) -> None:
-    """Only preindex sources that are stale or missing."""
-    index = index_manager_var.get()
-    if index is None:
-        raise RuntimeError("Index manager not initialized")
-
-    allowed_urls = allowed_urls_var.get()
-    now = time.time()
-    to_index = []
-
-    # Check which sources need indexing
-    for url in allowed_urls:
-        st = index.sources.get(url)
-        if not st or (now - st.last_indexed) >= index.ttl_seconds:
-            to_index.append(url)
-
-    if not to_index:
-        logger.info("All sources are fresh, skipping preindex")
-        return
-
-    logger.info(f"Smart preindex: {len(to_index)}/{len(allowed_urls)} sources need updating")
-    start = time.time()
-
-    if parallel > 1:
-        # Parallel indexing
-        semaphore = asyncio.Semaphore(parallel)
-
-        async def index_one(url: str, idx: int):
-            async with semaphore:
-                logger.info(f"Fetching {url}...")
-                await index.maybe_refresh(url, force=True)
-                if ctx:
-                    await ctx.report_progress(f"Updated {idx}/{len(to_index)}: {url}")
-
-        tasks = [index_one(url, i) for i, url in enumerate(to_index, 1)]
-        await asyncio.gather(*tasks)
-    else:
-        # Sequential indexing
-        for i, url in enumerate(to_index, 1):
-            if ctx:
-                await ctx.report_progress(f"Updating {i}/{len(to_index)}: {url}")
-            logger.info(f"Fetching {url}...")
-            await index.maybe_refresh(url, force=True)
-
-    # Calculate total documents indexed
-    total_docs = sum(st.doc_count for st in index.sources.values())
-
-    if ctx:
-        await ctx.report_progress("Smart preindex complete")
-
-    logger.info(
-        "Indexing complete: %d sections from %d/%d sources updated (%.1fs)",
-        total_docs,
-        len(to_index),
-        len(allowed_urls),
-        time.time() - start,
-    )
-
-    # Display summary table
-    _display_indexing_summary(index)
+    _display_indexing_summary(index_manager)
 
 
 def main() -> None:
@@ -1205,139 +1086,81 @@ def main() -> None:
         urls.extend(args.sources_flag)
     if not urls:
         raise SystemExit("Provide at least one llms.txt URL via positional args or --sources")
-    ttl_seconds = parse_duration_to_seconds(args.ttl)
+
+    # Create config
+    cfg = Config(
+        allowed_urls=set(urls),
+        ttl_seconds=parse_duration_to_seconds(args.ttl),
+        timeout=args.timeout,
+        embed_model_name=args.embed_model,
+        store_mode=args.store if args.store else ("disk" if args.store_path else "memory"),
+        store_path=args.store_path,
+        max_get_bytes=args.max_get_bytes,
+        auto_retrieve_threshold=args.auto_retrieve_threshold,
+        auto_retrieve_limit=args.auto_retrieve_limit,
+        include_snippets=not args.no_snippets,
+        preindex=not args.no_preindex,
+        background_preindex=not args.no_background_preindex,
+    )
 
     async def run_server():
         """Run the server with managed resources."""
-        # Invert the no-* flags to get the actual settings
-        lazy_embed = not args.no_lazy_embed
-        preindex = not args.no_preindex  # Preindex by default
-        smart_preindex = not args.no_smart_preindex
-        background_preindex = not args.no_background_preindex
-
-        # Auto-detect storage mode based on store_path, unless explicitly overridden
-        if args.store is not None:
-            store = args.store
-        else:
-            store = "disk" if args.store_path else "memory"
-
-        # Track background tasks and shutdown state
-        background_tasks = set()
         shutdown_event = asyncio.Event()
 
-        async def shutdown_handler(sig):
-            """Handle shutdown signals gracefully."""
-            logger.info(f"Received {sig.name}, initiating graceful shutdown...")
+        def signal_handler(signum, _frame):
+            """Simple signal handler."""
+            logger.info(f"Received signal {signum}, shutting down...")
             shutdown_event.set()
 
-        def signal_handler_sync(signum, frame):
-            """Synchronous signal handler fallback."""
-            sig = signal.Signals(signum)
-            logger.info(f"Received {sig.name}, initiating graceful shutdown...")
-            shutdown_event.set()
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
-        async with managed_resources(
-            urls=urls,
-            ttl=ttl_seconds,
-            timeout=args.timeout,
-            embed_model=args.embed_model,
-            store=store,
-            store_path=args.store_path,
-            max_get_bytes=args.max_get_bytes,
-            lazy_embed=lazy_embed,
-            auto_retrieve_threshold=args.auto_retrieve_threshold,
-            auto_retrieve_limit=args.auto_retrieve_limit,
-            include_snippets=not args.no_snippets,
-        ):
-            # Set up signal handlers on the event loop
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                try:
-                    loop.add_signal_handler(
-                        sig, lambda s=sig: asyncio.create_task(shutdown_handler(s))
-                    )
-                    logger.debug(f"Registered handler for {sig.name}")
-                except (NotImplementedError, ValueError) as e:
-                    logger.warning(f"Could not register signal handler for {sig.name}: {e}")
-                    # Fall back to basic signal handling
-                    signal.signal(sig, signal_handler_sync)
-
-            # Log that server is ready
+        async with managed_resources(cfg):
             logger.info(
                 "llms-txt-mcp ready. Waiting for MCP client on stdio. Press Ctrl+C to exit."
             )
 
-            # Handle preindexing based on flags
+            # Handle preindexing
             preindex_task = None
-            if background_preindex and preindex:
-                # Start preindexing in background
-                if smart_preindex:
-                    logger.info("Starting automatic indexing in background...")
-                    preindex_task = asyncio.create_task(
-                        smart_preindex_sources(parallel=args.parallel_preindex)
-                    )
+            if cfg.preindex:
+                if cfg.background_preindex:
+                    logger.info("Starting indexing in background...")
+                    preindex_task = asyncio.create_task(preindex_sources())
                 else:
-                    logger.info("Starting full indexing in background...")
-                    preindex_task = asyncio.create_task(
-                        preindex_sources(parallel=args.parallel_preindex)
-                    )
-                background_tasks.add(preindex_task)
-            elif preindex:
-                # Preindex synchronously
-                if smart_preindex:
-                    await smart_preindex_sources(parallel=args.parallel_preindex)
-                else:
-                    await preindex_sources(parallel=args.parallel_preindex)
+                    await preindex_sources()
 
             try:
-                # Create server task
-                logger.debug("Starting MCP server with stdio transport...")
+                # Run server
                 server_task = asyncio.create_task(mcp.run_stdio_async())
+                shutdown_task = asyncio.create_task(shutdown_event.wait())
 
-                # Create shutdown wait task
-                shutdown_wait_task = asyncio.create_task(shutdown_event.wait())
-
-                # Wait for either server completion or shutdown signal
-                done, pending = await asyncio.wait(
-                    {server_task, shutdown_wait_task}, return_when=asyncio.FIRST_COMPLETED
+                done, _ = await asyncio.wait(
+                    {server_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
                 )
 
-                # Check which task completed
-                if shutdown_wait_task in done:
-                    logger.info("Shutdown signal received, stopping MCP server...")
+                if shutdown_task in done:
+                    logger.info("Shutting down...")
                     server_task.cancel()
                     try:
                         await asyncio.wait_for(server_task, timeout=2.0)
                     except (TimeoutError, asyncio.CancelledError):
                         pass
-                elif server_task in done:
-                    logger.info("MCP server stopped normally")
-
             except Exception as e:
                 logger.error(f"Server error: {e}")
-
             finally:
-                # Remove signal handlers
-                for sig in (signal.SIGTERM, signal.SIGINT):
+                # Cancel preindex task if still running
+                if preindex_task and not preindex_task.done():
+                    preindex_task.cancel()
                     try:
-                        loop.remove_signal_handler(sig)
-                    except (ValueError, OSError):
+                        await preindex_task
+                    except asyncio.CancelledError:
                         pass
-
-                # Cancel all background tasks
-                for task in background_tasks:
-                    if not task.done():
-                        task.cancel()
-
-                # Wait for background tasks to complete
-                if background_tasks:
-                    await asyncio.gather(*background_tasks, return_exceptions=True)
 
     # Run the async server
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:
-        # This shouldn't happen with proper signal handlers, but just in case
         pass
     finally:
         logger.info("Server shutdown complete")

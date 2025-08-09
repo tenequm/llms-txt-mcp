@@ -258,18 +258,6 @@ wheels = [
 ]
 
 [[package]]
-name = "fastcore"
-version = "1.8.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "packaging" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ce/d0/c49361f37e115a56eaff0bff640c63f4099a9976ab007f43cba02c771e4b/fastcore-1.8.7.tar.gz", hash = "sha256:ff4d976abaf2e298265e675cf8bf504f6ee2ab5fc159f9b4f153c6a5a03f6bf7", size = 76591, upload-time = "2025-07-25T15:57:50.42Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bd/2f/e37fbde84c64468ec72093b0fc822c86ba6c8038a3ea66dddf82c758ae27/fastcore-1.8.7-py3-none-any.whl", hash = "sha256:3d71e9bae64d335dfad9bff58ff8985091e8fbc23651b0b1b8d16fa4895ff42d", size = 79342, upload-time = "2025-07-25T15:57:48.125Z" },
-]
-
-[[package]]
 name = "filelock"
 version = "3.18.0"
 source = { registry = "https://pypi.org/simple" }
@@ -574,26 +562,12 @@ wheels = [
 ]
 
 [[package]]
-name = "llms-txt"
-version = "0.0.4"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "fastcore" },
-    { name = "httpx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/49/4d/64d9dc27bd943dda92685dbd5497fbe6da604adc147431dff425ae344908/llms-txt-0.0.4.tar.gz", hash = "sha256:3e4f5f52c39a7fe2352756e3cfc5f9e1098389cca42a27f64704f26f167a91c0", size = 14929, upload-time = "2024-09-23T20:34:27.655Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/19/397f1dff707b9a0ef1382afcee68e7008a2fad8dac6899c01240bc2498ca/llms_txt-0.0.4-py3-none-any.whl", hash = "sha256:16bbb8947c46ba634d23887291f9ce0253e905a6ac8f8c99f46eed86a656af65", size = 13431, upload-time = "2024-09-23T20:34:26.239Z" },
-]
-
-[[package]]
 name = "llms-txt-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "chromadb" },
     { name = "httpx" },
-    { name = "llms-txt" },
     { name = "mcp", extra = ["cli"] },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -612,7 +586,6 @@ dev = [
 requires-dist = [
     { name = "chromadb", specifier = ">=0.5.0" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "llms-txt", specifier = ">=0.0.4" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.12.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11.0" },
     { name = "pydantic", specifier = ">=2.0.0" },

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.llms_txt_mcp.parsers.format_detector import detect_format
+from src.parser import detect_format
 
 
 @pytest.fixture

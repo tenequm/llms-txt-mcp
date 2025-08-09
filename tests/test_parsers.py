@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.llms_txt_mcp.parsers.parser import parse_llms_txt
+from src.parser import parse_llms_txt
 
 
 @pytest.fixture

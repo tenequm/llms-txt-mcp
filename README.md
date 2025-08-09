@@ -1,7 +1,7 @@
 # llms-txt-mcp
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-18%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-26%20passing-brightgreen.svg)](#development)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MCP SDK 1.12+](https://img.shields.io/badge/MCP%20SDK-1.12+-purple.svg)](https://github.com/modelcontextprotocol/python-sdk)
 
@@ -276,7 +276,7 @@ uv run --directory /path/to/llms-mcp-txt llms-txt-mcp --version
 uv run pytest                    # Run tests
 uv run ruff check .             # Check code quality  
 uv run ruff format .            # Format code
-uv run mypy src/                # Type check
+uv run mypy                     # Type check
 
 # With arguments
 uv run llms-txt-mcp https://ai-sdk.dev/llms.txt --preindex
@@ -297,13 +297,17 @@ npx @modelcontextprotocol/inspector uv run llms-txt-mcp https://ai-sdk.dev/llms.
 ## Architecture
 
 ```
-src/llms_txt_mcp/
+src/
 ├── server.py           # FastMCP server with all tools
-├── __init__.py        # Package exports
+├── parsers/
+│   ├── __init__.py
+│   ├── format_detector.py
+│   └── parser.py       # Multi-format llms.txt parsing
+└── __init__.py         # Package exports
 ```
 
 **Key Design Decisions:**
-- Single file architecture for simplicity
+- Simple, flat structure following KISS principles
 - Streaming parser for large file support
 - Lazy loading for instant startup
 - Search-first to minimize context usage
