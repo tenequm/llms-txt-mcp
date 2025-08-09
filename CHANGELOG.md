@@ -6,3 +6,4 @@
 - Default retrieval cap: 75KB (`--max-get-bytes 75000`).
 - Dynamic User-Agent `llms-txt-mcp/{version}`.
 
+

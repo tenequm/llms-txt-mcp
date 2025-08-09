@@ -65,3 +65,8 @@ class TestStandardFormat:
         """Test that Docker docs use standard format."""
         content = load_fixture("docs-docker-com-llms.txt")
         assert detect_format(content) == "standard-llms-txt"
+
+    def test_detect_standard_format_minimal(self, load_fixture):
+        """Test that minimal.llms.txt uses standard format with links."""
+        content = load_fixture("minimal.llms.txt")
+        assert detect_format(content) == "standard-llms-txt"

@@ -28,7 +28,7 @@ def minimal_content():
 @pytest.fixture
 def large_content():
     """Load large test fixture."""
-    return (FIXTURES_DIR / "large.llms.txt").read_text(encoding="utf-8")
+    return (FIXTURES_DIR / "ai-sdk-dev-llms.txt").read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -134,161 +134,6 @@ async def server_setup(mock_http_client):
 # Removed legacy cache tests; new implementation uses TTL/ETag on network + Chroma storage.
 
 
-class TestParser:
-    """Test parsing functionality (high-level via IndexManager parsing)."""
-
-    def test_extract_headers(self, minimal_content):
-        from llms_txt_mcp.server import parse_llms_text
-
-        sections = parse_llms_text(minimal_content)
-        assert isinstance(sections, list)
-        assert len(sections) > 0
-        assert all("title" in s and "content" in s for s in sections)
-
-    def test_extract_multiple_header_levels(self):
-        """Test that we extract all header levels (H1, H2, H3, etc.), not just H1."""
-        test_content = """# Main Title
-
-## Section 1
-Content here
-
-### Subsection 1.1
-More content
-
-#### Deep Section
-Even more content
-
-## Section 2
-Final content
-
-### Subsection 2.1
-Last bit
-"""
-        from llms_txt_mcp.server import parse_llms_text
-
-        sections = parse_llms_text(test_content)
-        got_titles = [s["title"] for s in sections]
-        assert "Main Title" in got_titles or "Section 1" in got_titles
-
-    def test_large_fixture_has_multiple_headers(self, large_content):
-        """Large fixture should parse into many sections."""
-        from llms_txt_mcp.server import parse_llms_text
-
-        sections = parse_llms_text(large_content)
-        titles = [s["title"] for s in sections]
-        assert len(titles) > 10
-        # Ensure we parsed a reasonable number of sections
-        assert len(titles) > 10
-
-    def test_exact_section_count_in_large_fixture(self, large_content):
-        """Large fixture should parse exactly 132 sections as documented."""
-        from llms_txt_mcp.server import parse_llms_text
-
-        sections = parse_llms_text(large_content)
-        assert len(sections) == 132, f"Expected 132 sections but got {len(sections)}"
-
-        # Verify first and last sections
-        assert sections[0]["title"] == "RAG Agent"
-        assert sections[-1]["title"] == "OpenAI Compatible Providers"
-
-    def test_proper_structured_parsing_with_yaml(self, large_content):
-        """YAML blocks should produce many sections with titles and content."""
-        from llms_txt_mcp.server import parse_yaml_blocks
-
-        secs = parse_yaml_blocks(large_content)
-        assert isinstance(secs, list)
-        assert len(secs) >= 20
-        assert all("title" in s for s in secs)
-
-    def test_yaml_frontmatter_extraction(self):
-        """Test extraction of YAML frontmatter metadata."""
-        content_with_yaml = """---
-title: Test Document
-description: A sample document for testing
-tags: [ai, sdk, test]
----
-
-# Main Title
-
-## Section 1
-Content here
-"""
-
-        from llms_txt_mcp.server import parse_official_headings, parse_yaml_blocks
-
-        yaml_secs = parse_yaml_blocks(content_with_yaml)
-        assert len(yaml_secs) >= 1
-        assert yaml_secs[0]["title"] == "Test Document"
-        assert "A sample document for testing" in (yaml_secs[0]["description"] or "")
-
-        # Should also parse markdown headings fallback
-        md_secs = parse_official_headings(content_with_yaml)
-        titles = [s["title"] for s in md_secs]
-        assert "Main Title" in titles
-        assert any("Section 1" == t or t.startswith("Section 1") for t in titles)
-
-    def test_h1_navigation_with_minimal_fixture(self, minimal_content):
-        """Official llms.txt should at least yield sections for H1/H2."""
-        from llms_txt_mcp.server import parse_official_headings
-
-        secs = parse_official_headings(minimal_content)
-        titles = [s["title"] for s in secs]
-        assert "llms.txt" in titles
-        assert any(t == "Docs" for t in titles)
-
-    def test_extract_section(self, minimal_content):
-        """Section extraction via headings parser: select 'Docs' content."""
-        from llms_txt_mcp.server import parse_official_headings
-
-        secs = parse_official_headings(minimal_content)
-        doc = next((s for s in secs if s["title"].lower() == "docs".lower()), None)
-        assert doc is not None
-        assert "Docs" in doc["content"]
-
-    def test_consecutive_yaml_blocks(self):
-        """Test parsing of consecutive YAML blocks without content between them."""
-        content = """---
-title: First Section
-description: First description
-tags: [tag1, tag2]
----
-
-This is the content of the first section.
-
----
-title: Second Section
-description: Second description
-tags: [tag3, tag4]
----
-
-This is the content of the second section.
-
----
-title: Third Section
-description: Third description
----
-
-This is the content of the third section.
-"""
-        from llms_txt_mcp.server import parse_yaml_blocks
-
-        sections = parse_yaml_blocks(content)
-        assert len(sections) == 3, f"Expected 3 sections but got {len(sections)}"
-
-        # Verify all sections are parsed correctly
-        assert sections[0]["title"] == "First Section"
-        assert sections[0]["description"] == "First description"
-        assert "first section" in sections[0]["content"].lower()
-
-        assert sections[1]["title"] == "Second Section"
-        assert sections[1]["description"] == "Second description"
-        assert "second section" in sections[1]["content"].lower()
-
-        assert sections[2]["title"] == "Third Section"
-        assert sections[2]["description"] == "Third description"
-        assert "third section" in sections[2]["content"].lower()
-
-
 @pytest.mark.asyncio
 class TestMCPTools:
     """Test MCP tool functionality."""
@@ -312,13 +157,14 @@ class TestMCPTools:
         )
         assert hasattr(result, "search_results")
         assert hasattr(result, "retrieved_content")
-        assert hasattr(result, "metadata")
+        assert hasattr(result, "auto_retrieved_count")
+        assert hasattr(result, "total_results")
 
         # Check that we got search results
         assert isinstance(result.search_results, list)
 
         # If auto-retrieve worked, we should have retrieved content
-        if result.metadata.auto_retrieved_count > 0:
+        if result.auto_retrieved_count > 0:
             assert len(result.retrieved_content) > 0
 
     async def test_refresh(self, server_setup):
@@ -346,7 +192,7 @@ class TestMCPTools:
         assert hasattr(result, "merged_content")
         assert isinstance(result.search_results, list)
 
-        if result.metadata.auto_retrieved_count >= 2:
+        if result.auto_retrieved_count >= 2:
             # Check that merged content was returned
             assert isinstance(result.merged_content, str)
             assert len(result.merged_content) > 0
@@ -381,17 +227,19 @@ class TestPerformanceClaims:
         )
 
         # Should parse without errors
-        from llms_txt_mcp.server import parse_llms_text
+        from llms_txt_mcp.parsers import parse_llms_txt
 
-        sections = parse_llms_text(large_content)
+        result = parse_llms_txt(large_content)
+        sections = result["docs"]
         assert len(sections) > 0
 
     def test_fast_structure_discovery(self, large_content):
         """Test fast structure discovery (<1000ms)."""
         start_time = time.time()
-        from llms_txt_mcp.server import parse_llms_text
+        from llms_txt_mcp.parsers import parse_llms_txt
 
-        sections = parse_llms_text(large_content)
+        result = parse_llms_txt(large_content)
+        sections = result["docs"]
         duration_ms = (time.time() - start_time) * 1000
 
         assert len(sections) > 0
@@ -401,9 +249,10 @@ class TestPerformanceClaims:
 
     def test_clean_context_windows(self, large_content):
         """Test that structure responses are much smaller than full content."""
-        from llms_txt_mcp.server import parse_llms_text
+        from llms_txt_mcp.parsers import parse_llms_txt
 
-        secs = parse_llms_text(large_content)
+        result = parse_llms_txt(large_content)
+        secs = result["docs"]
         meta = [{"title": s.get("title"), "len": len(s.get("content", ""))} for s in secs[:50]]
         structure_json = json.dumps(meta)
 
@@ -416,9 +265,10 @@ class TestPerformanceClaims:
 
     def test_surgical_section_extraction(self, large_content):
         """Test precise section extraction."""
-        from llms_txt_mcp.server import parse_llms_text
+        from llms_txt_mcp.parsers import parse_llms_txt
 
-        secs = parse_llms_text(large_content)
+        result = parse_llms_txt(large_content)
+        secs = result["docs"]
         if not secs:
             pytest.skip("No sections in large fixture")
         first = secs[0]

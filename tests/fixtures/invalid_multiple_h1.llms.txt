@@ -1,9 +1,0 @@
-# First Title
-
-> Summary for the first title
-
-Some content here.
-
-# Second Title
-
-This violates the spec which requires exactly one H1 header.

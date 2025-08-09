@@ -29,10 +29,20 @@ def fetch_llms_txt(url: str) -> str:
 ## Commands
 
 ```bash
-uv sync --all-extras    # Install
-uv run llms-txt-mcp     # Run
-uv run pytest           # Test
-uv run ruff format .    # Format
+# Quick development
+make check              # Run all checks (format, lint, test)
+make fix                # Auto-fix issues and run checks
+
+# Individual tasks
+make format             # Format code
+make lint               # Lint code
+make test               # Run tests
+make type               # Type check (non-strict)
+
+# Setup
+make install            # Install dependencies
+make clean              # Clean cache files
+make help               # Show all commands
 ```
 
 ## Remember

@@ -53,33 +53,31 @@ def _is_yaml_frontmatter_format(content: str) -> bool:
 
 
 def _is_standard_format(content: str) -> bool:
-    """Check if content is standard llms.txt format (simple list)."""
-    lines = content.strip().split("\n")
+    """Check if content appears to be an index (has markdown links in structured format)."""
+    # Check for markdown links in the content
+    link_pattern = r"^\s*-\s*\[.+\]\(.+\)"
+    links = re.findall(link_pattern, content, re.MULTILINE)
 
-    # Standard format characteristics:
-    # - Has a title (# Title)
-    # - Has section headers (## Section)
-    # - Mostly list items with links (high ratio of links to total lines)
-    has_title = False
-    section_headers = 0
-    link_items = 0
-    total_content_lines = 0
+    # If we have links, check if it's primarily a link index
+    if links:
+        lines = content.split("\n")
+        non_empty_lines = [line for line in lines if line.strip()]
 
-    for line in lines:
-        stripped = line.strip()
-        if stripped:  # Non-empty line
-            total_content_lines += 1
-            if stripped.startswith("# ") and not stripped.startswith("## "):
-                has_title = True
-            elif stripped.startswith("## "):
-                section_headers += 1
-            elif re.match(r"^\s*-\s*\[.+\]\(.+\)", line):
-                link_items += 1
+        # Case 1: H2 sections with link lists (original robust logic)
+        h2_sections = re.findall(r"^## .+$", content, re.MULTILINE)
+        if h2_sections:
+            h2_with_links_pattern = r"^## .+\n+(?:^[\s-]*\[.+\]\(.+\).*$\n?)+"
+            h2_with_links = re.findall(h2_with_links_pattern, content, re.MULTILINE)
+            ratio = len(h2_with_links) / len(h2_sections)
+            return ratio > 0.5
 
-    if total_content_lines == 0:
-        return False
+        # Case 2: H1 + high link density (primarily an index, not content)
+        has_h1 = bool(re.search(r"^# [^#]", content, re.MULTILINE))
+        if has_h1 and non_empty_lines:
+            # Calculate link density: links / non-empty lines
+            link_density = len(links) / len(non_empty_lines)
+            # Only consider it standard format if >10% of lines are links
+            # This filters out content-heavy documents with sparse links
+            return link_density > 0.1
 
-    link_ratio = link_items / total_content_lines
-
-    # Standard format: has title, sections, and mostly links (>50% of content)
-    return has_title and section_headers > 0 and link_ratio > 0.5
+    return False

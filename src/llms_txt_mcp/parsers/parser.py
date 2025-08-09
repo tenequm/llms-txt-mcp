@@ -13,16 +13,20 @@ def parse_llms_txt(content: str) -> dict[str, Any]:
     format_type = detect_format(content)
 
     if format_type == "yaml-frontmatter-full-llms-txt":
-        return _parse_yaml_frontmatter(content)
+        result = _parse_yaml_frontmatter(content)
     elif format_type == "standard-llms-txt":
-        return _parse_standard(content)
+        result = _parse_standard(content)
     else:  # standard-full-llms-txt
-        return _parse_standard_full(content)
+        result = _parse_standard_full(content)
+
+    # Add format type to result
+    result["format"] = format_type
+    return result
 
 
 def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
     """Parse YAML frontmatter format."""
-    articles = []
+    docs = []
     lines = content.splitlines()
     i = 0
     n = len(lines)
@@ -94,7 +98,7 @@ def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
                     content_lines.append(lines[i])
                     i += 1
 
-            articles.append(
+            docs.append(
                 {
                     "title": title,
                     "description": description,
@@ -104,47 +108,73 @@ def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
         else:
             i += 1
 
-    return {"articles": articles}
+    return {"docs": docs}
 
 
 def _parse_standard(content: str) -> dict[str, Any]:
-    """Parse standard llms.txt format."""
-    articles = []
+    """Parse standard llms.txt format with contextual titles."""
+    docs = []
     lines = content.strip().split("\n")
 
-    # Track current section for context
+    # Track document title (H1) and current section (H2) for context
+    document_title = None
     current_section = None
 
     # Match markdown links: - [Title](URL) with optional description
     link_pattern = re.compile(r"^\s*-\s*\[([^\]]+)\]\(([^)]*)\)(?:\s*:\s*(.*))?")
 
     for line in lines:
-        # Track section headers
-        if line.strip().startswith("## "):
-            current_section = line.strip()[3:].strip()
+        stripped = line.strip()
+
+        # Capture H1 document title
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            document_title = stripped[2:].strip()
+        # Track H2 section headers
+        elif stripped.startswith("## "):
+            current_section = stripped[3:].strip()
         # Extract links
         else:
             match = link_pattern.match(line)
             if match:
-                title = match.group(1)
+                original_title = match.group(1)
                 url = match.group(2).strip()
                 description = match.group(3).strip() if match.group(3) else None
 
                 # Only add if URL is not empty
                 if url:
-                    article = {"title": title, "url": url}
+                    # Build contextual title: "Document Section Original"
+                    title_parts = []
+                    if document_title:
+                        title_parts.append(document_title)
+                    if current_section:
+                        title_parts.append(current_section)
+                    title_parts.append(original_title)
+
+                    contextual_title = " ".join(title_parts)
+
+                    article = {
+                        "title": contextual_title,
+                        "url": url,
+                        "original_title": original_title,
+                    }
                     if description:
                         article["description"] = description
+                    else:
+                        # Use contextual title as description for better search results
+                        article["description"] = contextual_title
+
+                    # Keep section info for backward compatibility
                     if current_section:
                         article["section"] = current_section
-                    articles.append(article)
 
-    return {"articles": articles}
+                    docs.append(article)
+
+    return {"docs": docs}
 
 
 def _parse_standard_full(content: str) -> dict[str, Any]:
     """Parse standard-full llms.txt format."""
-    articles = []
+    docs = []
     lines = content.strip().split("\n")
 
     current_article = None
@@ -156,7 +186,7 @@ def _parse_standard_full(content: str) -> dict[str, Any]:
             # Save previous article if exists
             if current_article:
                 current_article["content"] = "\n".join(current_content).strip()
-                articles.append(current_article)
+                docs.append(current_article)
 
             # Start new article
             title = line[2:].strip()
@@ -170,6 +200,6 @@ def _parse_standard_full(content: str) -> dict[str, Any]:
     # Don't forget the last article
     if current_article:
         current_article["content"] = "\n".join(current_content).strip()
-        articles.append(current_article)
+        docs.append(current_article)
 
-    return {"articles": articles}
+    return {"docs": docs}

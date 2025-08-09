@@ -12,15 +12,10 @@
       "command": "uv",
       "args": [
         "run",
-        "--directory",
-        "/Users/tenequm/Projects/llms-txt-mcp",
         "llms-txt-mcp",
-        "https://ai-sdk.dev/llms.txt",
-        "https://vercel.com/docs/llms.txt",
-        "https://nextjs.org/docs/llms.txt",
-        "https://hono.dev/llms-full.txt",
-        "https://orm.drizzle.team/llms-full.txt",
-        "https://zod.dev/llms.txt"
+        "--store-path", "tmp/mcp-data",
+        "https://gofastmcp.com/llms.txt",
+        "https://modelcontextprotocol.io/llms.txt"
       ]
     }
   }

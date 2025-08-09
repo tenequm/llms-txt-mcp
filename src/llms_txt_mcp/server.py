@@ -30,6 +30,8 @@ import dataclasses
 import hashlib
 import logging
 import re
+import signal
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -48,11 +50,12 @@ except ImportError:
 
 import chromadb
 import httpx
-import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import Context
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+
+from .parsers import parse_llms_txt
 
 try:
     # Chroma telemetry settings (0.5+)
@@ -60,7 +63,11 @@ try:
 except Exception:  # pragma: no cover - fallback if import path changes
     ChromaSettings = None  # type: ignore
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
 logger = logging.getLogger("llms-txt-mcp")
 
 
@@ -77,6 +84,8 @@ class SourceState:
     last_modified: str | None
     last_indexed: float
     doc_count: int
+    format_type: str | None = None  # Track detected format
+    actual_url: str | None = None  # Track if auto-upgraded to llms-full.txt
 
 
 # -------------------------
@@ -101,7 +110,6 @@ class SearchResult(BaseModel):
     title: str = Field(description="Document title")
     description: str = Field(default="", description="Document description")
     score: float = Field(description="Similarity score (0-1)")
-    score_category: str = Field(description="Relevance category: high/medium/low")
     auto_retrieved: bool = Field(default=False, description="Whether content was auto-retrieved")
     snippet: str = Field(default="", description="Relevant content snippet")
 
@@ -123,25 +131,17 @@ class RefreshResult(BaseModel):
     counts: dict[str, int] = Field(description="Document counts per source")
 
 
-class QueryMetadata(BaseModel):
-    """Metadata about the query execution."""
-
-    auto_retrieved_count: int = Field(description="Number of documents auto-retrieved")
-    total_results: int = Field(description="Total search results found")
-    query_interpretation: str = Field(description="How the query was processed")
-    suggestion: str = Field(default="", description="Suggestion for better results")
-    auto_retrieve_threshold: float = Field(description="Threshold used for auto-retrieval")
-
-
 class QueryResult(BaseModel):
-    """Combined search and retrieval result."""
+    """Combined search and retrieval result with metadata."""
 
     search_results: list[SearchResult] = Field(description="Search results with scores")
     retrieved_content: dict[str, DocContent] = Field(
         default_factory=dict, description="Auto-retrieved document contents"
     )
     merged_content: str = Field(default="", description="Merged content if merge=true")
-    metadata: QueryMetadata = Field(description="Query execution metadata")
+    # Metadata fields merged directly
+    auto_retrieved_count: int = Field(default=0, description="Number of documents auto-retrieved")
+    total_results: int = Field(default=0, description="Total search results found")
 
 
 # -------------------------
@@ -192,49 +192,7 @@ auto_retrieve_limit_var: ContextVar[int] = ContextVar("auto_retrieve_limit", def
 include_snippets_var: ContextVar[bool] = ContextVar("include_snippets", default=True)
 
 
-# Getter functions for context variables
-def get_allowed_urls() -> set[str]:
-    return allowed_urls_var.get()
-
-
-def get_http_client() -> httpx.AsyncClient | None:
-    return http_client_var.get()
-
-
-def get_embedding_model() -> LazyEmbeddingModel | SentenceTransformer | None:
-    return embedding_model_var.get()
-
-
-def get_chroma_client() -> chromadb.Client | None:
-    return chroma_client_var.get()
-
-
-def get_chroma_collection() -> chromadb.Collection | None:
-    return chroma_collection_var.get()
-
-
-def get_ttl_seconds() -> int:
-    return ttl_seconds_var.get()
-
-
-def get_default_max_get_bytes() -> int:
-    return default_max_get_bytes_var.get()
-
-
-def get_index_manager() -> IndexManager | None:
-    return index_manager_var.get()
-
-
-def get_auto_retrieve_threshold() -> float:
-    return auto_retrieve_threshold_var.get()
-
-
-def get_auto_retrieve_limit() -> int:
-    return auto_retrieve_limit_var.get()
-
-
-def get_include_snippets() -> bool:
-    return include_snippets_var.get()
+# No getter functions needed - use var.get() directly
 
 
 # -------------------------
@@ -301,16 +259,6 @@ def host_of(url: str) -> str:
     return urlparse(url).netloc
 
 
-def categorize_score(score: float) -> str:
-    """Categorize similarity score into human-readable relevance."""
-    if score >= 0.3:
-        return "high"
-    elif score >= 0.15:
-        return "medium"
-    else:
-        return "low"
-
-
 def extract_snippet(content: str, query_terms: list[str], max_length: int = 200) -> str:
     """Extract a relevant snippet from content based on query terms."""
     if not content or not query_terms:
@@ -345,258 +293,6 @@ def extract_snippet(content: str, query_terms: list[str], max_length: int = 200)
 
 
 # -------------------------
-# Parsing
-# -------------------------
-
-
-def parse_yaml_blocks(content: str) -> list[dict[str, Any]]:
-    """Parse AI SDK style repeated YAML-frontmatter blocks.
-
-    Returns a list of dicts: {title, description, tags, content}
-    """
-    sections: list[dict[str, Any]] = []
-    lines = content.splitlines()
-    i = 0
-    n = len(lines)
-    while i < n:
-        if lines[i].strip() == "---":
-            i += 1
-            yaml_lines: list[str] = []
-            while i < n and lines[i].strip() != "---":
-                yaml_lines.append(lines[i])
-                i += 1
-            if i < n and lines[i].strip() == "---":
-                i += 1  # consume closing ---
-            else:
-                continue
-            try:
-                meta = yaml.safe_load("\n".join(yaml_lines)) or {}
-            except yaml.YAMLError:
-                meta = {}
-            if not isinstance(meta, dict) or "title" not in meta:
-                continue
-            title = str(meta.get("title", "Untitled"))
-            description = str(meta.get("description", ""))
-            tags = meta.get("tags") or []
-
-            content_lines: list[str] = []
-            # Collect content until we hit another YAML frontmatter block or EOF
-            while i < n:
-                # Check if we're at the start of a new YAML block
-                if lines[i].strip() == "---":
-                    # Look ahead to see if this is a real YAML frontmatter
-                    j = i + 1
-                    found_title = False
-                    # Look for title within next 20 lines (reasonable YAML header size)
-                    while j < n and j < i + 20 and lines[j].strip() != "---":
-                        if lines[j].startswith("title:"):
-                            found_title = True
-                            break
-                        j += 1
-                    # If we found a title and a closing ---, this is a new section
-                    if found_title and j < n and j < i + 20:
-                        # Check if there's a closing --- after the title
-                        while j < n and j < i + 20:
-                            if lines[j].strip() == "---":
-                                # This is definitely a new YAML block, stop collecting content
-                                break
-                            j += 1
-                        else:
-                            # No closing ---, treat as content
-                            content_lines.append(lines[i])
-                            i += 1
-                            continue
-                        # Found a real YAML block, stop here
-                        break
-                    else:
-                        # Not a YAML block, just content with ---
-                        content_lines.append(lines[i])
-                        i += 1
-                else:
-                    content_lines.append(lines[i])
-                    i += 1
-
-            sections.append(
-                {
-                    "title": title,
-                    "description": description,
-                    "tags": tags if isinstance(tags, list) else [str(tags)],
-                    "content": "\n".join(content_lines).strip(),
-                }
-            )
-        else:
-            i += 1
-    return sections
-
-
-_H1 = re.compile(r"^#\s+(.+)$")
-_H2 = re.compile(r"^##\s+(.+)$")
-
-
-def parse_official_headings(content: str) -> list[dict[str, Any]]:
-    """Parse official llms.txt headings: prefer H2 sections; H1 fallback."""
-    lines = content.splitlines()
-    sections: list[dict[str, Any]] = []
-    current_title: str | None = None
-    current_desc: str = ""
-    current_lines: list[str] = []
-    saw_h2 = False
-
-    for line in lines:
-        m2 = _H2.match(line)
-        m1 = None if m2 else _H1.match(line)
-        if m2:
-            saw_h2 = True
-            if current_title is not None:
-                sections.append(
-                    {
-                        "title": current_title,
-                        "description": current_desc,
-                        "tags": [],
-                        "content": "\n".join(current_lines).strip(),
-                    }
-                )
-            current_title = m2.group(1).strip()
-            current_desc = ""
-            current_lines = []
-        elif m1 and not saw_h2:
-            if current_title is not None:
-                sections.append(
-                    {
-                        "title": current_title,
-                        "description": current_desc,
-                        "tags": [],
-                        "content": "\n".join(current_lines).strip(),
-                    }
-                )
-            current_title = m1.group(1).strip()
-            current_desc = ""
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    if current_title is not None:
-        sections.append(
-            {
-                "title": current_title,
-                "description": current_desc,
-                "tags": [],
-                "content": "\n".join(current_lines).strip(),
-            }
-        )
-
-    return sections
-
-
-def parse_link_list(content: str) -> list[dict[str, Any]]:
-    """Parse link-list format (e.g., Claude docs with - [title](url): description)."""
-    lines = content.splitlines()
-    sections: list[dict[str, Any]] = []
-    in_docs_section = False
-
-    for line in lines:
-        # Look for ## Docs section
-        if line.strip() == "## Docs":
-            in_docs_section = True
-            continue
-
-        # Stop at next heading
-        if in_docs_section and line.strip().startswith("#"):
-            break
-
-        # Parse link lines
-        if in_docs_section and line.strip().startswith("- ["):
-            # Match patterns like: - [Title](url): Description
-            # or: - [Title](url)
-            match = re.match(r"^- \[([^\]]+)\]\(([^)]+)\)(?:\s*:\s*(.+))?$", line.strip())
-            if match:
-                title = match.group(1).strip()
-                url = match.group(2).strip()
-                description = match.group(3).strip() if match.group(3) else ""
-
-                sections.append(
-                    {
-                        "title": title,
-                        "description": description,
-                        "tags": [],
-                        "content": f"Documentation available at: {url}\n\n{description}"
-                        if description
-                        else f"Documentation available at: {url}",
-                    }
-                )
-
-    return sections
-
-
-def parse_separator_sections(content: str) -> list[dict[str, Any]]:
-    """Parse content with --- separators (not YAML frontmatter)."""
-    # Split by lines that are just "---" (with optional whitespace)
-    parts = re.split(r"^---\s*$", content, flags=re.MULTILINE)
-
-    sections: list[dict[str, Any]] = []
-
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-
-        lines = part.splitlines()
-        if not lines:
-            continue
-
-        # First non-empty line is the title
-        title = ""
-        content_lines = []
-        found_title = False
-
-        for line in lines:
-            if not found_title and line.strip():
-                # Remove leading # if present
-                title = line.strip().lstrip("#").strip()
-                found_title = True
-            elif found_title:
-                content_lines.append(line)
-
-        if title:
-            sections.append(
-                {
-                    "title": title,
-                    "description": "",
-                    "tags": [],
-                    "content": "\n".join(content_lines).strip(),
-                }
-            )
-
-    return sections
-
-
-def parse_llms_text(content: str) -> list[dict[str, Any]]:
-    """Try all parsers in order and return first non-empty result."""
-    # Try YAML frontmatter first (AI SDK style)
-    sections = parse_yaml_blocks(content)
-    if sections:
-        return sections
-
-    # Try link list format (Claude docs style)
-    sections = parse_link_list(content)
-    if sections:
-        return sections
-
-    # Try official heading format (MCP/llmstxt.org style)
-    sections = parse_official_headings(content)
-    if sections:
-        return sections
-
-    # Try separator format (llms-full.txt style)
-    sections = parse_separator_sections(content)
-    if sections:
-        return sections
-
-    # Fallback: treat entire content as single section
-    return [{"title": "Documentation", "description": "", "tags": [], "content": content.strip()}]
-
-
-# -------------------------
 # Index Manager
 # -------------------------
 
@@ -608,8 +304,8 @@ class IndexManager:
         self.sources: dict[str, SourceState] = {}
 
     def ensure_collection(self) -> chromadb.Collection:
-        chroma_client = get_chroma_client()
-        chroma_collection = get_chroma_collection()
+        chroma_client = chroma_client_var.get()
+        chroma_collection = chroma_collection_var.get()
 
         if chroma_client is None:
             raise RuntimeError("Chroma client not initialized")
@@ -632,7 +328,7 @@ class IndexManager:
     async def _stream_lines(
         self, url: str, headers: dict[str, str]
     ) -> tuple[AsyncIterator[str], dict[str, str]]:
-        http_client = get_http_client()
+        http_client = http_client_var.get()
         if http_client is None:
             raise RuntimeError("HTTP client not initialized")
 
@@ -678,29 +374,24 @@ class IndexManager:
 
     async def _fetch_and_parse_sections(
         self, url: str, etag: str | None, last_modified: str | None
-    ) -> tuple[int, list[dict[str, Any]], str | None, str | None]:
-        """Fetch and parse llms.txt with auto-discovery for llms-full.txt."""
+    ) -> tuple[int, list[dict[str, Any]], str | None, str | None, str]:
+        """Fetch and parse llms.txt with auto-discovery for llms-full.txt.
+
+        Returns: (status_code, sections, etag, last_modified, actual_url_used)
+        """
         headers: dict[str, str] = {}
         if etag:
             headers["If-None-Match"] = etag
         if last_modified:
             headers["If-Modified-Since"] = last_modified
 
-        # Determine URLs to try - always prefer full version
-        urls_to_try = []
-        base_url = url.replace("/llms.txt", "")
-
-        # Always try llms-full.txt first for better content
+        # Try llms-full.txt first if URL ends with llms.txt
+        urls_to_try: list[str] = []
         if url.endswith("/llms.txt"):
-            urls_to_try.append(f"{base_url}/llms-full.txt")
-            urls_to_try.append(url)
+            base_url = url[:-9]  # Remove /llms.txt
+            urls_to_try = [f"{base_url}/llms-full.txt", url]
         else:
-            # If they explicitly asked for llms-full.txt or other file, use it
-            urls_to_try.append(url)
-
-        sections = []
-        final_etag = None
-        final_last_mod = None
+            urls_to_try = [url]
 
         for try_url in urls_to_try:
             try:
@@ -708,68 +399,54 @@ class IndexManager:
                     try_url, headers if try_url == url else {}
                 )
 
-                # Collect all lines from the stream
-                all_lines: list[str] = []
-                async for line in lines_iter:
-                    all_lines.append(line)
-
+                # Collect and parse content
+                all_lines = [line async for line in lines_iter]
                 if not all_lines:
                     continue
 
-                # Parse the complete content
-                full_content = "\n".join(all_lines)
-                parsed_sections = parse_llms_text(full_content)
+                result = parse_llms_txt("\n".join(all_lines))
+                sections = result["docs"]
+                format_type = result.get("format", "unknown")
 
-                # Check if we got only links and should try llms-full.txt
-                if (
-                    try_url == url
-                    and False  # This logic is now handled by always trying llms-full.txt first
-                    and len(parsed_sections) > 0
-                    and all(
-                        "Documentation available at:" in sec.get("content", "")
-                        for sec in parsed_sections[:5]
-                    )
-                ):
-                    # This looks like a link-only file, try llms-full.txt
-                    full_url = f"{base_url}/llms-full.txt"
-                    try:
-                        full_lines_iter, full_hdrs = await self._stream_lines(full_url, {})
-                        full_lines = []
-                        async for line in full_lines_iter:
-                            full_lines.append(line)
+                # Create short format name for logging
+                format_name = format_type.replace("-llms-txt", "").replace("-full", "")
 
-                        if full_lines:
-                            full_parsed = parse_llms_text("\n".join(full_lines))
-                            if full_parsed and len(full_parsed) > len(parsed_sections):
-                                # Use the full version if it has more content
-                                sections = full_parsed
-                                final_etag = full_hdrs.get("ETag")
-                                final_last_mod = full_hdrs.get("Last-Modified")
-                                logger.info(f"Auto-discovered richer content at {full_url}")
-                                break
-                    except Exception:
-                        # llms-full.txt doesn't exist or failed, use original
-                        pass
+                # Log format: original_url → actual_file [format] sections
+                file_type = "llms-full.txt" if try_url.endswith("/llms-full.txt") else "llms.txt"
+                if try_url != url:
+                    # Auto-upgrade happened
+                    logger.info(f"{url} → {file_type} [{format_name}] {len(sections)} sections")
+                else:
+                    logger.info(f"{url} [{format_name}] {len(sections)} sections")
 
-                # Use the parsed sections
-                sections = parsed_sections
-                final_etag = hdrs.get("ETag")
-                final_last_mod = hdrs.get("Last-Modified")
-                break
+                return (
+                    200,
+                    sections,
+                    hdrs.get("ETag"),
+                    hdrs.get("Last-Modified"),
+                    try_url,
+                    format_type,
+                )
 
             except Exception as e:
-                if try_url == urls_to_try[-1]:
-                    # Last URL failed, re-raise
+                if try_url == urls_to_try[-1]:  # Last URL, re-raise
                     raise
-                # Try next URL
                 logger.debug(f"Failed to fetch {try_url}: {e}")
                 continue
 
-        return 200, sections, final_etag, final_last_mod
+        # Should never reach here
+        raise Exception(f"Failed to fetch from any URL: {urls_to_try}")
 
     async def _index_source(self, source_url: str, prior: SourceState | None) -> None:
         try:
-            code, sections, etag, last_mod = await self._fetch_and_parse_sections(
+            (
+                code,
+                sections,
+                etag,
+                last_mod,
+                actual_url,
+                format_type,
+            ) = await self._fetch_and_parse_sections(
                 source_url, prior.etag if prior else None, prior.last_modified if prior else None
             )
         except httpx.HTTPStatusError as e:
@@ -789,7 +466,7 @@ class IndexManager:
         host = host_of(source_url)
         collection = self.ensure_collection()
 
-        embedding_model = get_embedding_model()
+        embedding_model = embedding_model_var.get()
         if embedding_model is None:
             raise RuntimeError("Embedding model not initialized")
 
@@ -810,7 +487,8 @@ class IndexManager:
             metadatas.append(
                 {
                     "id": cid,
-                    "source": source_url,
+                    "source": actual_url,  # Use the actual URL that was fetched
+                    "requested_url": source_url,  # Original URL from config
                     "host": host,
                     "title": sec_title,
                     "description": sec_desc,  # Add description to metadata
@@ -819,17 +497,30 @@ class IndexManager:
                         sec_content
                     ),  # Add content hash for change detection
                     "section_index": idx,  # Add section index for ordering
+                    "indexed_at": time.time(),  # Timestamp for TTL-based cleanup
                 }
             )
 
-        # delete previous docs for this source (if supported)
+        # delete previous docs for this source (check both original and actual URLs)
         try:
+            # Try to delete docs with both the original URL and actual URL
+            all_ids_to_delete = []
+
+            # Check original URL
             existing = collection.get(where={"source": source_url}, include=["ids"])  # type: ignore[arg-type]
             if existing and existing.get("ids"):
-                existing_ids = existing["ids"]
+                all_ids_to_delete.extend(existing["ids"])
+
+            # Check actual URL if different
+            if actual_url != source_url:
+                existing_actual = collection.get(where={"source": actual_url}, include=["ids"])  # type: ignore[arg-type]
+                if existing_actual and existing_actual.get("ids"):
+                    all_ids_to_delete.extend(existing_actual["ids"])
+
+            if all_ids_to_delete:
                 try:
-                    collection.delete(ids=existing_ids)  # type: ignore[arg-type]
-                    logger.info(f"Deleted {len(existing_ids)} old documents from {source_url}")
+                    collection.delete(ids=all_ids_to_delete)  # type: ignore[arg-type]
+                    logger.info(f"Deleted {len(all_ids_to_delete)} old documents from {source_url}")
                 except Exception as e:
                     logger.warning(f"Failed to delete old documents from {source_url}: {e}")
                     # Continue with adding new documents anyway
@@ -850,23 +541,49 @@ class IndexManager:
             last_modified=last_mod,
             last_indexed=time.time(),
             doc_count=len(ids),
+            format_type=format_type,
+            actual_url=actual_url,
         )
 
-        # Log indexing results
+        # Log indexing results with format hint
         if len(ids) > 0:
-            logger.info(f"Indexed {len(ids)} sections from {source_url}")
+            # Infer format from sections structure
+            format_hint = ""
+            if sections and "url" in sections[0]:
+                format_hint = " (standard-llms-txt: links)"
+            elif sections and sections[0].get("description"):
+                format_hint = " (yaml-frontmatter)"
+            else:
+                format_hint = " (standard-full)"
+
+            # Show actual URL if different from requested
+            url_info = actual_url if actual_url != source_url else source_url
+            logger.info(f"Indexed {len(ids)} sections from {url_info}{format_hint}")
         else:
             logger.warning(f"No sections found in {source_url}")
 
     def search(self, query: str, limit: int, include_snippets: bool = True) -> list[dict[str, Any]]:
         collection = self.ensure_collection()
-        embedding_model = get_embedding_model()
+        embedding_model = embedding_model_var.get()
         if embedding_model is None:
             raise RuntimeError("Embedding model not initialized")
+
+        # Build list of valid source URLs (including actual URLs from redirects)
+        allowed_urls = allowed_urls_var.get()
+
         query_embedding = embedding_model.encode([query]).tolist()
+
+        # Query with filter for configured URLs
+        # Documents can match either by requested_url (original) or source (actual)
         res = collection.query(
             query_embeddings=query_embedding,
             n_results=min(max(limit, 1), 20),
+            where={
+                "$or": [
+                    {"requested_url": {"$in": list(allowed_urls)}},
+                    {"source": {"$in": list(allowed_urls)}},
+                ]
+            },
             include=["metadatas", "distances"],
         )  # type: ignore[arg-type]
         items: list[dict[str, Any]] = []
@@ -892,7 +609,6 @@ class IndexManager:
                     "title": meta.get("title"),
                     "description": meta.get("description", ""),
                     "score": round(score, 3),
-                    "score_category": categorize_score(score),
                     "auto_retrieved": False,  # Will be set by caller
                     "snippet": snippet,
                 }
@@ -948,6 +664,61 @@ class IndexManager:
             return {"merged": True, "content": "\n\n".join(merged_content_parts)}
         return {"merged": False, "items": results}
 
+    async def cleanup_expired_documents(self) -> int:
+        """Remove documents older than TTL from unconfigured sources.
+
+        Returns the number of documents cleaned up.
+        """
+        collection = self.ensure_collection()
+        allowed_urls = allowed_urls_var.get()
+        ttl_seconds = self.ttl_seconds
+        now = time.time()
+
+        # Get all documents to check their metadata
+        try:
+            all_docs = collection.get(include=["metadatas"])  # type: ignore[arg-type]
+            all_metas = all_docs.get("metadatas", [])
+        except Exception as e:
+            logger.debug(f"No documents to clean up: {e}")
+            return 0
+
+        if not all_metas:
+            return 0
+
+        # Group documents by their requested_url
+        docs_by_source: dict[str, list[tuple[str, float]]] = {}
+        for meta in all_metas:
+            doc_id = meta.get("id")
+            requested_url = meta.get("requested_url") or meta.get("source")
+            indexed_at = meta.get("indexed_at", 0)
+
+            if doc_id and requested_url:
+                if requested_url not in docs_by_source:
+                    docs_by_source[requested_url] = []
+                docs_by_source[requested_url].append((doc_id, indexed_at))
+
+        # Find expired documents from unconfigured sources
+        ids_to_delete = []
+        for source_url, doc_infos in docs_by_source.items():
+            if source_url not in allowed_urls:
+                # Check if all docs from this source are expired
+                for doc_id, indexed_at in doc_infos:
+                    if (now - indexed_at) > ttl_seconds:
+                        ids_to_delete.append(doc_id)
+
+        # Delete expired documents
+        if ids_to_delete:
+            try:
+                collection.delete(ids=ids_to_delete)  # type: ignore[arg-type]
+                logger.info(
+                    f"Cleaned up {len(ids_to_delete)} expired documents from unconfigured sources"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to clean up expired documents: {e}")
+                return 0
+
+        return len(ids_to_delete)
+
 
 # -------------------------
 # Tools
@@ -957,7 +728,7 @@ class IndexManager:
 @mcp.tool()
 async def docs_sources() -> list[SourceInfo]:
     """List indexed documentation sources."""
-    index = get_index_manager()
+    index = index_manager_var.get()
     if index is None:
         return []
 
@@ -980,12 +751,12 @@ async def docs_refresh(
     ctx: Context | None = None,
 ) -> RefreshResult:
     """Force refresh cached documentation."""
-    index = get_index_manager()
+    index = index_manager_var.get()
     if index is None:
         raise RuntimeError("Server not initialized")
 
     refreshed: list[str] = []
-    allowed_urls = get_allowed_urls()
+    allowed_urls = allowed_urls_var.get()
 
     if source:
         if source not in allowed_urls:
@@ -1031,7 +802,7 @@ async def docs_query(
     ),
 ) -> QueryResult:
     """Search documentation with optional auto-retrieval. Combines search + get functionality."""
-    index = get_index_manager()
+    index = index_manager_var.get()
     if index is None:
         raise RuntimeError("Server not initialized")
 
@@ -1039,23 +810,19 @@ async def docs_query(
     threshold = (
         auto_retrieve_threshold
         if auto_retrieve_threshold is not None
-        else get_auto_retrieve_threshold()
+        else auto_retrieve_threshold_var.get()
     )
     retrieve_limit = (
-        auto_retrieve_limit if auto_retrieve_limit is not None else get_auto_retrieve_limit()
+        auto_retrieve_limit if auto_retrieve_limit is not None else auto_retrieve_limit_var.get()
     )
-    include_snippets = get_include_snippets()
+    include_snippets = include_snippets_var.get()
 
     # Refresh stale sources
-    for url in list(get_allowed_urls()):
+    for url in list(allowed_urls_var.get()):
         await index.maybe_refresh(url)
 
     # Perform search
     search_results = index.search(query=query, limit=limit, include_snippets=include_snippets)
-
-    # Parse query for interpretation
-    query_terms = query.split()
-    query_interpretation = f"Searched for: {', '.join(query_terms)}"
 
     # Determine which IDs to retrieve
     ids_to_retrieve: list[str] = []
@@ -1087,27 +854,12 @@ async def docs_query(
             for item in result.get("items", []):
                 retrieved_content[item["id"]] = DocContent(**item)
 
-    # Generate suggestions
-    suggestion = ""
-    if not search_results:
-        suggestion = f"No results found. Try broader terms like: {', '.join(query_terms[:2])}"
-    elif auto_retrieved_count == 0 and auto_retrieve:
-        suggestion = (
-            f"Low scores found. Consider lowering threshold (current: {threshold}) "
-            f"or try related terms"
-        )
-
     return QueryResult(
         search_results=[SearchResult(**result) for result in search_results],
         retrieved_content=retrieved_content,
         merged_content=merged_content,
-        metadata=QueryMetadata(
-            auto_retrieved_count=auto_retrieved_count,
-            total_results=len(search_results),
-            query_interpretation=query_interpretation,
-            suggestion=suggestion,
-            auto_retrieve_threshold=threshold,
-        ),
+        auto_retrieved_count=auto_retrieved_count,
+        total_results=len(search_results),
     )
 
 
@@ -1153,9 +905,16 @@ def parse_args() -> argparse.Namespace:
         help="Load embedding model immediately instead of on first use",
     )
     parser.add_argument(
-        "--store", choices=["memory", "disk"], default="memory", help="Index store mode"
+        "--store",
+        choices=["memory", "disk"],
+        default=None,
+        help="Override auto-detected storage mode (auto-detects based on --store-path)",
     )
-    parser.add_argument("--store-path", default=None, help="Store path (required for --store=disk)")
+    parser.add_argument(
+        "--store-path",
+        default=None,
+        help="Store path for disk persistence (if provided, enables disk mode)",
+    )
     parser.add_argument(
         "--max-get-bytes", type=int, default=75000, help="Default byte cap for document retrieval"
     )
@@ -1238,8 +997,7 @@ async def managed_resources(
 
     # Initialize Chroma
     if store == "disk":
-        if not store_path:
-            raise ValueError("--store-path is required when --store=disk")
+        # store_path is guaranteed to exist when store="disk" due to auto-detection logic
         if ChromaSettings is not None:
             chroma_client = chromadb.PersistentClient(
                 path=store_path, settings=ChromaSettings(anonymized_telemetry=False)
@@ -1259,6 +1017,16 @@ async def managed_resources(
     # Initialize index manager
     index_manager = IndexManager(ttl_seconds=ttl, max_get_bytes=max_get_bytes)
     index_manager_var.set(index_manager)
+
+    # Clean up expired documents from unconfigured sources
+    if store == "disk":
+        # Only cleanup when using persistent storage
+        try:
+            cleaned_up = await index_manager.cleanup_expired_documents()
+            if cleaned_up > 0:
+                logger.info(f"Startup cleanup: removed {cleaned_up} expired documents")
+        except Exception as e:
+            logger.debug(f"Startup cleanup skipped: {e}")
 
     try:
         yield
@@ -1282,13 +1050,44 @@ async def managed_resources(
         index_manager_var.set(None)
 
 
+def _display_indexing_summary(index: IndexManager) -> None:
+    """Display a summary table of indexed sources."""
+    if not index.sources:
+        return
+
+    logger.info("=" * 60)
+    logger.info("Indexing Summary:")
+    logger.info("=" * 60)
+
+    for source_url, state in index.sources.items():
+        # Format the display based on what we know
+        format_name = "unknown"
+        if state.format_type:
+            format_name = state.format_type.replace("-llms-txt", "").replace("-full", "")
+
+        # Check if auto-upgrade happened
+        display_url = source_url
+        if state.actual_url and state.actual_url != source_url:
+            file_type = (
+                "llms-full.txt"
+                if state.actual_url.endswith("/llms-full.txt")
+                else state.actual_url.split("/")[-1]
+            )
+            display_url = f"{source_url} → {file_type}"
+
+        # Display the summary line
+        logger.info(f"{display_url} | {format_name} | {state.doc_count} sections")
+
+    logger.info("=" * 60)
+
+
 async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> None:
     """Pre-index all configured sources."""
-    index = get_index_manager()
+    index = index_manager_var.get()
     if index is None:
         raise RuntimeError("Index manager not initialized")
 
-    allowed_urls = get_allowed_urls()
+    allowed_urls = allowed_urls_var.get()
     total = len(allowed_urls)
     start = time.time()
     logger.info("Preindexing %d source(s)...", total)
@@ -1329,14 +1128,17 @@ async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> Non
         time.time() - start,
     )
 
+    # Display summary table
+    _display_indexing_summary(index)
+
 
 async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) -> None:
     """Only preindex sources that are stale or missing."""
-    index = get_index_manager()
+    index = index_manager_var.get()
     if index is None:
         raise RuntimeError("Index manager not initialized")
 
-    allowed_urls = get_allowed_urls()
+    allowed_urls = allowed_urls_var.get()
     now = time.time()
     to_index = []
 
@@ -1388,6 +1190,9 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
         time.time() - start,
     )
 
+    # Display summary table
+    _display_indexing_summary(index)
+
 
 def main() -> None:
     args = parse_args()
@@ -1410,12 +1215,33 @@ def main() -> None:
         smart_preindex = not args.no_smart_preindex
         background_preindex = not args.no_background_preindex
 
+        # Auto-detect storage mode based on store_path, unless explicitly overridden
+        if args.store is not None:
+            store = args.store
+        else:
+            store = "disk" if args.store_path else "memory"
+
+        # Track background tasks and shutdown state
+        background_tasks = set()
+        shutdown_event = asyncio.Event()
+
+        async def shutdown_handler(sig):
+            """Handle shutdown signals gracefully."""
+            logger.info(f"Received {sig.name}, initiating graceful shutdown...")
+            shutdown_event.set()
+
+        def signal_handler_sync(signum, frame):
+            """Synchronous signal handler fallback."""
+            sig = signal.Signals(signum)
+            logger.info(f"Received {sig.name}, initiating graceful shutdown...")
+            shutdown_event.set()
+
         async with managed_resources(
             urls=urls,
             ttl=ttl_seconds,
             timeout=args.timeout,
             embed_model=args.embed_model,
-            store=args.store,
+            store=store,
             store_path=args.store_path,
             max_get_bytes=args.max_get_bytes,
             lazy_embed=lazy_embed,
@@ -1423,14 +1249,26 @@ def main() -> None:
             auto_retrieve_limit=args.auto_retrieve_limit,
             include_snippets=not args.no_snippets,
         ):
-            # Log that server is ready immediately
+            # Set up signal handlers on the event loop
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(
+                        sig, lambda s=sig: asyncio.create_task(shutdown_handler(s))
+                    )
+                    logger.debug(f"Registered handler for {sig.name}")
+                except (NotImplementedError, ValueError) as e:
+                    logger.warning(f"Could not register signal handler for {sig.name}: {e}")
+                    # Fall back to basic signal handling
+                    signal.signal(sig, signal_handler_sync)
+
+            # Log that server is ready
             logger.info(
                 "llms-txt-mcp ready. Waiting for MCP client on stdio. Press Ctrl+C to exit."
             )
 
             # Handle preindexing based on flags
             preindex_task = None
-
             if background_preindex and preindex:
                 # Start preindexing in background
                 if smart_preindex:
@@ -1443,6 +1281,7 @@ def main() -> None:
                     preindex_task = asyncio.create_task(
                         preindex_sources(parallel=args.parallel_preindex)
                     )
+                background_tasks.add(preindex_task)
             elif preindex:
                 # Preindex synchronously
                 if smart_preindex:
@@ -1451,24 +1290,57 @@ def main() -> None:
                     await preindex_sources(parallel=args.parallel_preindex)
 
             try:
-                # Run the MCP server in a thread to avoid blocking the event loop
-                await asyncio.to_thread(mcp.run)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                logger.info("Shutting down...")
-            except Exception as e:
-                logger.error(f"Server error: {e}")
-            finally:
-                # Cancel background task if still running
-                if preindex_task and not preindex_task.done():
-                    logger.debug("Cancelling preindex task...")
-                    preindex_task.cancel()
+                # Create server task
+                logger.debug("Starting MCP server with stdio transport...")
+                server_task = asyncio.create_task(mcp.run_stdio_async())
+
+                # Create shutdown wait task
+                shutdown_wait_task = asyncio.create_task(shutdown_event.wait())
+
+                # Wait for either server completion or shutdown signal
+                done, pending = await asyncio.wait(
+                    {server_task, shutdown_wait_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Check which task completed
+                if shutdown_wait_task in done:
+                    logger.info("Shutdown signal received, stopping MCP server...")
+                    server_task.cancel()
                     try:
-                        await asyncio.wait_for(preindex_task, timeout=1.0)
+                        await asyncio.wait_for(server_task, timeout=2.0)
                     except (TimeoutError, asyncio.CancelledError):
                         pass
+                elif server_task in done:
+                    logger.info("MCP server stopped normally")
+
+            except Exception as e:
+                logger.error(f"Server error: {e}")
+
+            finally:
+                # Remove signal handlers
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    try:
+                        loop.remove_signal_handler(sig)
+                    except (ValueError, OSError):
+                        pass
+
+                # Cancel all background tasks
+                for task in background_tasks:
+                    if not task.done():
+                        task.cancel()
+
+                # Wait for background tasks to complete
+                if background_tasks:
+                    await asyncio.gather(*background_tasks, return_exceptions=True)
 
     # Run the async server
-    asyncio.run(run_server())
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        # This shouldn't happen with proper signal handlers, but just in case
+        pass
+    finally:
+        logger.info("Server shutdown complete")
 
 
 if __name__ == "__main__":

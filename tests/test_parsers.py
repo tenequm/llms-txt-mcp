@@ -44,7 +44,35 @@ class TestArticleCounting:
         content = load_fixture(fixture_name)
         result = parse_llms_txt(content)
 
-        assert "articles" in result, f"Parser result missing 'articles' key for {fixture_name}"
-        assert len(result["articles"]) == expected_count, (
-            f"{fixture_name}: Expected {expected_count} articles, got {len(result['articles'])}"
+        assert "docs" in result, f"Parser result missing 'docs' key for {fixture_name}"
+        assert len(result["docs"]) == expected_count, (
+            f"{fixture_name}: Expected {expected_count} articles, got {len(result['docs'])}"
         )
+
+
+class TestErrorHandling:
+    """Test parser handles errors gracefully."""
+
+    def test_parser_handles_empty_file(self):
+        """Parser doesn't crash on empty input."""
+        result = parse_llms_txt("")
+        assert "docs" in result
+        assert isinstance(result["docs"], list)
+        assert len(result["docs"]) == 0
+
+    def test_parser_handles_malformed_input(self):
+        """Parser doesn't crash on garbage input."""
+        garbage_inputs = [
+            "@#$%^&*()_+",
+            "---\nbroken: yaml: :\n---\n",
+            "\x00\x01\x02\x03",  # null bytes
+            "# " * 10000,  # many headers
+            "\n" * 10000,  # many newlines
+        ]
+
+        for garbage in garbage_inputs:
+            result = parse_llms_txt(garbage)
+            assert "docs" in result, f"Parser crashed on: {garbage[:20]}..."
+            assert isinstance(result["docs"], list), (
+                f"Parser returned non-list for: {garbage[:20]}..."
+            )

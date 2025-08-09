@@ -89,7 +89,12 @@ disallow_untyped_defs = true
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 asyncio_mode = "auto"
+addopts = "--tb=short --strict-markers"
 markers = [
-    "performance: marks tests as performance tests (may be slower)"
+    "performance: marks tests as performance tests (may be slower)",
+    "format_detection: tests for detecting llms.txt formats",
+    "parsing: tests for parsing llms.txt content",
+    "mcp_tools: tests for MCP tool functionality",
+    "integration: integration tests"
 ]
 
