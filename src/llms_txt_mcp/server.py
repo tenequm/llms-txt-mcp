@@ -190,7 +190,6 @@ index_manager_var: ContextVar[IndexManager | None] = ContextVar("index_manager",
 auto_retrieve_threshold_var: ContextVar[float] = ContextVar("auto_retrieve_threshold", default=0.1)
 auto_retrieve_limit_var: ContextVar[int] = ContextVar("auto_retrieve_limit", default=5)
 include_snippets_var: ContextVar[bool] = ContextVar("include_snippets", default=True)
-prefer_full_var: ContextVar[bool] = ContextVar("prefer_full", default=False)
 
 
 # Getter functions for context variables
@@ -236,10 +235,6 @@ def get_auto_retrieve_limit() -> int:
 
 def get_include_snippets() -> bool:
     return include_snippets_var.get()
-
-
-def get_prefer_full() -> bool:
-    return prefer_full_var.get()
 
 
 # -------------------------
@@ -691,16 +686,16 @@ class IndexManager:
         if last_modified:
             headers["If-Modified-Since"] = last_modified
 
-        # Determine URLs to try based on preference
+        # Determine URLs to try - always prefer full version
         urls_to_try = []
         base_url = url.replace("/llms.txt", "")
 
-        if get_prefer_full():
-            # Try llms-full.txt first if prefer_full is enabled
+        # Always try llms-full.txt first for better content
+        if url.endswith("/llms.txt"):
             urls_to_try.append(f"{base_url}/llms-full.txt")
             urls_to_try.append(url)
         else:
-            # Standard behavior: try llms.txt first
+            # If they explicitly asked for llms-full.txt or other file, use it
             urls_to_try.append(url)
 
         sections = []
@@ -728,7 +723,7 @@ class IndexManager:
                 # Check if we got only links and should try llms-full.txt
                 if (
                     try_url == url
-                    and not get_prefer_full()
+                    and False  # This logic is now handled by always trying llms-full.txt first
                     and len(parsed_sections) > 0
                     and all(
                         "Documentation available at:" in sec.get("content", "")
@@ -1165,11 +1160,6 @@ def parse_args() -> argparse.Namespace:
         "--max-get-bytes", type=int, default=75000, help="Default byte cap for document retrieval"
     )
     parser.add_argument(
-        "--prefer-full",
-        action="store_true",
-        help="Prefer llms-full.txt over llms.txt when available",
-    )
-    parser.add_argument(
         "--auto-retrieve-threshold",
         type=float,
         default=0.1,
@@ -1200,7 +1190,6 @@ async def managed_resources(
     auto_retrieve_threshold: float = 0.1,
     auto_retrieve_limit: int = 5,
     include_snippets: bool = True,
-    prefer_full: bool = False,
 ):
     """Async context manager for managing all server resources."""
     # Validate and store URLs
@@ -1223,7 +1212,6 @@ async def managed_resources(
     auto_retrieve_threshold_var.set(auto_retrieve_threshold)
     auto_retrieve_limit_var.set(auto_retrieve_limit)
     include_snippets_var.set(include_snippets)
-    prefer_full_var.set(prefer_full)
 
     # Initialize HTTP client
     http_client = httpx.AsyncClient(
@@ -1434,7 +1422,6 @@ def main() -> None:
             auto_retrieve_threshold=args.auto_retrieve_threshold,
             auto_retrieve_limit=args.auto_retrieve_limit,
             include_snippets=not args.no_snippets,
-            prefer_full=args.prefer_full,
         ):
             # Log that server is ready immediately
             logger.info(
