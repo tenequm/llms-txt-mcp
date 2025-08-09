@@ -28,7 +28,7 @@ class TestArticleCounting:
     """Test article counting across different llms.txt formats."""
 
     @pytest.mark.parametrize(
-        "fixture_name,expected_count",
+        ("fixture_name", "expected_count"),
         [
             ("docs-docker-com-llms.txt", 1110),
             ("ai-sdk-dev-llms.txt", 132),
@@ -44,9 +44,9 @@ class TestArticleCounting:
         content = load_fixture(fixture_name)
         result = parse_llms_txt(content)
 
-        assert "docs" in result, f"Parser result missing 'docs' key for {fixture_name}"
-        assert len(result["docs"]) == expected_count, (
-            f"{fixture_name}: Expected {expected_count} articles, got {len(result['docs'])}"
+        assert hasattr(result, "docs"), f"Parser result missing 'docs' attribute for {fixture_name}"
+        assert len(result.docs) == expected_count, (
+            f"{fixture_name}: Expected {expected_count} articles, got {len(result.docs)}"
         )
 
 
@@ -56,9 +56,9 @@ class TestErrorHandling:
     def test_parser_handles_empty_file(self):
         """Parser doesn't crash on empty input."""
         result = parse_llms_txt("")
-        assert "docs" in result
-        assert isinstance(result["docs"], list)
-        assert len(result["docs"]) == 0
+        assert hasattr(result, "docs")
+        assert isinstance(result.docs, list)
+        assert len(result.docs) == 0
 
     def test_parser_handles_malformed_input(self):
         """Parser doesn't crash on garbage input."""
@@ -72,7 +72,5 @@ class TestErrorHandling:
 
         for garbage in garbage_inputs:
             result = parse_llms_txt(garbage)
-            assert "docs" in result, f"Parser crashed on: {garbage[:20]}..."
-            assert isinstance(result["docs"], list), (
-                f"Parser returned non-list for: {garbage[:20]}..."
-            )
+            assert hasattr(result, "docs"), f"Parser crashed on: {garbage[:20]}..."
+            assert isinstance(result.docs, list), f"Parser returned non-list for: {garbage[:20]}..."

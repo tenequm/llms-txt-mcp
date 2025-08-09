@@ -1,9 +1,29 @@
 """Parser for llms.txt files."""
 
-import re
-from typing import Any
+from __future__ import annotations
 
-import yaml
+import re
+
+import yaml  # type: ignore[import-untyped]
+from pydantic import BaseModel, Field
+
+
+class ParsedDoc(BaseModel):
+    """Structure for parsed document sections."""
+
+    title: str = Field(description="Document title")
+    description: str = Field(default="", description="Document description")
+    content: str = Field(default="", description="Document content")
+    url: str = Field(default="", description="Document URL (for standard format)")
+    original_title: str = Field(default="", description="Original title from source")
+    section: str = Field(default="", description="Section name (for standard format)")
+
+
+class ParseResult(BaseModel):
+    """Result from parsing llms.txt files."""
+
+    docs: list[ParsedDoc] = Field(description="List of parsed documents")
+    format: str = Field(description="Detected format type")
 
 
 def detect_format(content: str) -> str:
@@ -86,7 +106,7 @@ def _is_standard_format(content: str) -> bool:
     return False
 
 
-def parse_llms_txt(content: str) -> dict[str, Any]:
+def parse_llms_txt(content: str) -> ParseResult:
     """Parse llms.txt content and return structured data."""
     format_type = detect_format(content)
 
@@ -97,12 +117,11 @@ def parse_llms_txt(content: str) -> dict[str, Any]:
     else:  # standard-full-llms-txt
         result = _parse_standard_full(content)
 
-    # Add format type to result
-    result["format"] = format_type
-    return result
+    # Return ParseResult with format type
+    return ParseResult(docs=result["docs"], format=format_type)
 
 
-def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
+def _parse_yaml_frontmatter(content: str) -> dict[str, list[ParsedDoc]]:
     """Parse YAML frontmatter format."""
     docs = []
     lines = content.splitlines()
@@ -168,20 +187,19 @@ def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
                             continue
                         # Found a real YAML block, stop here
                         break
-                    else:
-                        # Not a YAML block, just content with dashes
-                        content_lines.append(lines[i])
-                        i += 1
+                    # Not a YAML block, just content with dashes
+                    content_lines.append(lines[i])
+                    i += 1
                 else:
                     content_lines.append(lines[i])
                     i += 1
 
             docs.append(
-                {
-                    "title": title,
-                    "description": description,
-                    "content": "\n".join(content_lines).strip(),
-                }
+                ParsedDoc(
+                    title=title,
+                    description=description,
+                    content="\n".join(content_lines).strip(),
+                )
             )
         else:
             i += 1
@@ -189,7 +207,7 @@ def _parse_yaml_frontmatter(content: str) -> dict[str, Any]:
     return {"docs": docs}
 
 
-def _parse_standard(content: str) -> dict[str, Any]:
+def _parse_standard(content: str) -> dict[str, list[ParsedDoc]]:
     """Parse standard llms.txt format with contextual titles."""
     docs = []
     lines = content.strip().split("\n")
@@ -230,27 +248,21 @@ def _parse_standard(content: str) -> dict[str, Any]:
 
                     contextual_title = " ".join(title_parts)
 
-                    article = {
-                        "title": contextual_title,
-                        "url": url,
-                        "original_title": original_title,
-                    }
-                    if description:
-                        article["description"] = description
-                    else:
-                        # Use contextual title as description for better search results
-                        article["description"] = contextual_title
-
-                    # Keep section info for backward compatibility
-                    if current_section:
-                        article["section"] = current_section
-
-                    docs.append(article)
+                    docs.append(
+                        ParsedDoc(
+                            title=contextual_title,
+                            url=url,
+                            original_title=original_title,
+                            description=description
+                            or contextual_title,  # Use contextual title as fallback
+                            section=current_section or "",
+                        )
+                    )
 
     return {"docs": docs}
 
 
-def _parse_standard_full(content: str) -> dict[str, Any]:
+def _parse_standard_full(content: str) -> dict[str, list[ParsedDoc]]:
     """Parse standard-full llms.txt format."""
     docs = []
     lines = content.strip().split("\n")
@@ -264,7 +276,7 @@ def _parse_standard_full(content: str) -> dict[str, Any]:
             # Save previous article if exists
             if current_article:
                 current_article["content"] = "\n".join(current_content).strip()
-                docs.append(current_article)
+                docs.append(ParsedDoc(**current_article))
 
             # Start new article
             title = line[2:].strip()
@@ -278,6 +290,6 @@ def _parse_standard_full(content: str) -> dict[str, Any]:
     # Don't forget the last article
     if current_article:
         current_article["content"] = "\n".join(current_content).strip()
-        docs.append(current_article)
+        docs.append(ParsedDoc(**current_article))
 
     return {"docs": docs}

@@ -240,7 +240,7 @@ class TestPerformanceClaims:
         from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
-        sections = result["docs"]
+        sections = result.docs
         assert len(sections) > 0
 
     def test_fast_structure_discovery(self, large_content):
@@ -249,7 +249,7 @@ class TestPerformanceClaims:
         from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
-        sections = result["docs"]
+        sections = result.docs
         duration_ms = (time.time() - start_time) * 1000
 
         assert len(sections) > 0
@@ -262,8 +262,8 @@ class TestPerformanceClaims:
         from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
-        secs = result["docs"]
-        meta = [{"title": s.get("title"), "len": len(s.get("content", ""))} for s in secs[:50]]
+        secs = result.docs
+        meta = [{"title": s.title, "len": len(s.content)} for s in secs[:50]]
         structure_json = json.dumps(meta)
 
         structure_size = len(structure_json)
@@ -278,11 +278,11 @@ class TestPerformanceClaims:
         from src.parser import parse_llms_txt
 
         result = parse_llms_txt(large_content)
-        secs = result["docs"]
+        secs = result.docs
         if not secs:
             pytest.skip("No sections in large fixture")
         first = secs[0]
-        section_content = first.get("content", "")
+        section_content = first.content
         section_size = len(section_content)
         full_size = len(large_content)
         ratio = full_size / max(1, section_size)

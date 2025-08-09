@@ -49,3 +49,6 @@ dmypy.json
 tmp
 .llmstxtenv/
 .ruff_cache/
+
+# Auto-generated version files (hatch-vcs)
+src/_version.py

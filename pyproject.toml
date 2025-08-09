@@ -1,6 +1,6 @@
 [project]
 name = "llms-txt-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Lean MCP server for minimal-context docs via llms.txt"
 readme = "README.md"
 license = {text = "MIT"}
@@ -51,7 +51,7 @@ Repository = "https://github.com/tenequm/llms-mcp-txt"
 Issues = "https://github.com/tenequm/llms-mcp-txt/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -68,12 +68,47 @@ line-length = 100
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "UP",   # pyupgrade
+    # Core linting
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    
+    # Type safety & annotations
+    "ANN",    # flake8-annotations (require type annotations)
+    "FA",     # flake8-future-annotations
+    "TC",     # flake8-type-checking
+    
+    # Code quality & bug prevention
+    "B",      # flake8-bugbear (common bugs)
+    "SIM",    # flake8-simplify (simpler constructs)
+    "C4",     # flake8-comprehensions (better comprehensions)
+    "PIE",    # flake8-pie (unnecessary code)
+    "RET",    # flake8-return (clean returns)
+    
+    # Modern Python practices
+    "YTT",    # flake8-2020 (misuse of sys.version)
+    "DTZ",    # flake8-datetimez (timezone aware datetimes)
+    "RSE",    # flake8-raise (better exception raising)
+    "T20",    # flake8-print (no print statements)
+    "PT",     # flake8-pytest-style (pytest best practices)
 ]
+
+# Per-file ignores for practical development
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = [
+    "ANN",     # Allow missing annotations in tests
+    "T20",     # Allow print in tests
+]
+"__init__.py" = [
+    "F401",    # Allow unused imports in __init__ files
+]
+
+# Annotation-specific settings
+[tool.ruff.lint.flake8-annotations]
+allow-star-arg-any = true        # Allow Any for *args, **kwargs
+suppress-dummy-args = true       # Suppress for dummy args like _
 
 [tool.ruff.format]
 quote-style = "double"
@@ -96,4 +131,60 @@ markers = [
     "mcp_tools: tests for MCP tool functionality",
     "integration: integration tests"
 ]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/_version.py"
+
+[tool.git-cliff.changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+## {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}]({{ remote.github.owner }}/{{ remote.github.repo }}/commit/{{ commit.id }}))
+{%- if commit.breaking %}
+  
+  **BREAKING:** {{ commit.breaking_description }}
+{%- endif %}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[tool.git-cliff.git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactoring" },
+    { message = "^style", group = "Styling" },
+    { message = "^test", group = "Testing" },
+    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore\\(deps\\)", skip = true },
+    { message = "^chore\\(pr\\)", skip = true },
+    { message = "^chore\\(pull\\)", skip = true },
+    { message = "^chore|^ci", group = "Miscellaneous Tasks" },
+    { body = ".*security", group = "Security" },
+    { message = "^revert", group = "Revert" },
+]
+filter_commits = false
+tag_pattern = "v[0-9].*"
+skip_tags = "v0.1.0-beta.1"
+ignore_tags = ""
+topo_order = false
+sort_commits = "oldest"
 

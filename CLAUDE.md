@@ -4,6 +4,7 @@ MCP server for fetching and parsing llms.txt files.
 
 ## Core Principles
 
+- **uv FIRST** - This project uses `uv` for ALL Python operations. Never use `pip`, `python -m`, or virtualenv directly.
 - **Follow official MCP SDK patterns** - Always check latest docs at modelcontextprotocol.io
 - **KISS** - Keep it simple, stupid. Simplest solution that works.
 - **DRY** - Don't repeat yourself. Reuse, don't duplicate.
@@ -28,21 +29,32 @@ def fetch_llms_txt(url: str) -> str:
 
 ## Commands
 
+**ALWAYS USE UV - Never pip, python -m, or virtualenv!**
+
 ```bash
-# Quick development
-make check              # Run all checks (format, lint, test)
+# Quick development with uv
+make check              # Run all checks (format, lint, test) 
 make fix                # Auto-fix issues and run checks
 
-# Individual tasks
-make format             # Format code
-make lint               # Lint code
-make test               # Run tests
-make type               # Type check (non-strict)
+# Individual tasks (all use uv internally)
+make format             # Format code with uv run ruff
+make lint               # Lint code with uv run ruff  
+make test               # Run tests with uv run pytest
+make type               # Type check with uv run mypy
 
-# Setup
-make install            # Install dependencies
+# Setup with uv
+make install            # uv sync dependencies
 make clean              # Clean cache files
 make help               # Show all commands
+
+# Direct uv commands for reference
+uv sync                 # Install/sync dependencies
+uv run pytest          # Run tests
+uv run ruff check .     # Lint code
+uv run ruff format .    # Format code  
+uv run mypy src/        # Type check
+uv build                # Build package
+uv publish              # Publish to PyPI
 ```
 
 ## Remember

@@ -12,6 +12,8 @@ Enforces TTL + ETag/Last-Modified for freshness. Ephemeral by default; optional 
 Follows latest FastMCP patterns from the MCP Python SDK.
 """
 
+from __future__ import annotations
+
 # /// script
 # dependencies = [
 #     "mcp>=1.0.0",
@@ -21,9 +23,6 @@ Follows latest FastMCP patterns from the MCP Python SDK.
 #     "pyyaml>=6.0.0"
 # ]
 # ///
-
-from __future__ import annotations
-
 import argparse
 import asyncio
 import dataclasses
@@ -33,28 +32,35 @@ import re
 import signal
 import sys
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+    from types import FrameType
 
 try:
     from importlib.metadata import version
 
     __version__ = version("llms-txt-mcp")
 except ImportError:
-    # Fallback for development/editable installs
-    __version__ = "0.1.0-dev"
+    # Fallback for development/editable installs when importlib.metadata fails
+    try:
+        from ._version import __version__
+    except ImportError:
+        # Final fallback if version file doesn't exist (development mode)
+        __version__ = "0.1.0-dev"
 
 import chromadb
 import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.server import Context
+from mcp.server.fastmcp.server import Context  # noqa: TC002
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
-from .parser import parse_llms_txt
+from .parser import ParsedDoc, parse_llms_txt
 
 try:
     # Chroma telemetry settings (0.5+)
@@ -68,6 +74,26 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("llms-txt-mcp")
+
+
+# -------------------------
+# Type definitions
+# -------------------------
+
+
+class ChromaMetadata(BaseModel):
+    """Metadata stored in Chroma collection."""
+
+    id: str = Field(description="Unique document identifier")
+    source: str = Field(description="Source URL of the document")
+    host: str = Field(description="Host domain of the source")
+    title: str = Field(description="Document title")
+    description: str = Field(default="", description="Document description")
+    content: str = Field(description="Document content")
+    requested_url: str = Field(default="", description="Original requested URL")
+    content_hash: str = Field(default="", description="Content hash for change detection")
+    section_index: int = Field(default=0, description="Section index for ordering")
+    indexed_at: float = Field(default=0, description="Timestamp when indexed")
 
 
 # -------------------------
@@ -329,7 +355,7 @@ class IndexManager:
                     # Split into lines while keeping remainder in buffer
                     parts = decoder.split(buffer)
                     # If buffer ends with newline, no remainder; else keep last part
-                    if buffer.endswith("\n") or buffer.endswith("\r"):
+                    if buffer.endswith(("\n", "\r")):
                         buffer = ""
                         lines_to_yield = parts
                         if lines_to_yield and lines_to_yield[-1] == "":
@@ -349,7 +375,7 @@ class IndexManager:
 
     async def _fetch_and_parse_sections(
         self, url: str, etag: str | None, last_modified: str | None
-    ) -> tuple[int, list[dict[str, Any]], str | None, str | None, str]:
+    ) -> tuple[int, list[ParsedDoc], str | None, str | None, str]:
         """Fetch and parse llms.txt with auto-discovery for llms-full.txt.
 
         Returns: (status_code, sections, etag, last_modified, actual_url_used)
@@ -380,8 +406,8 @@ class IndexManager:
                     continue
 
                 result = parse_llms_txt("\n".join(all_lines))
-                sections = result["docs"]
-                format_type = result.get("format", "unknown")
+                sections = result.docs
+                format_type = result.format
 
                 # Create short format name for logging
                 format_name = format_type.replace("-llms-txt", "").replace("-full", "")
@@ -426,9 +452,8 @@ class IndexManager:
             if e.response.status_code == 404:
                 logger.warning(f"Source not found (404): {source_url}")
                 return
-            else:
-                logger.error(f"HTTP error fetching {source_url}: {e}")
-                raise
+            logger.error(f"HTTP error fetching {source_url}: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error indexing {source_url}: {e}")
             raise
@@ -445,12 +470,12 @@ class IndexManager:
 
         ids: list[str] = []
         docs: list[str] = []
-        metadatas: list[dict[str, Any]] = []
+        metadatas: list[ChromaMetadata] = []
 
         for idx, sec in enumerate(sections):
-            sec_title = sec.get("title") or "Untitled"
-            sec_desc = sec.get("description") or ""
-            sec_content = sec.get("content") or ""
+            sec_title = sec.title or "Untitled"
+            sec_desc = sec.description
+            sec_content = sec.content
             # Ensure ID uniqueness even when titles repeat by appending a stable ordinal suffix
             cid = f"{canonical_id(source_url, sec_title)}-{idx:03d}"
             ids.append(cid)
@@ -458,20 +483,20 @@ class IndexManager:
             embedding_text = f"{sec_title}\n{sec_desc}\n{sec_desc}\n{sec_content}"
             docs.append(embedding_text)
             metadatas.append(
-                {
-                    "id": cid,
-                    "source": actual_url,  # Use the actual URL that was fetched
-                    "requested_url": source_url,  # Original URL from config
-                    "host": host,
-                    "title": sec_title,
-                    "description": sec_desc,  # Add description to metadata
-                    "content": sec_content,
-                    "content_hash": get_content_hash(
+                ChromaMetadata(
+                    id=cid,
+                    source=actual_url,  # Use the actual URL that was fetched
+                    requested_url=source_url,  # Original URL from config
+                    host=host,
+                    title=sec_title,
+                    description=sec_desc,  # Add description to metadata
+                    content=sec_content,
+                    content_hash=get_content_hash(
                         sec_content
                     ),  # Add content hash for change detection
-                    "section_index": idx,  # Add section index for ordering
-                    "indexed_at": time.time(),  # Timestamp for TTL-based cleanup
-                }
+                    section_index=idx,  # Add section index for ordering
+                    indexed_at=time.time(),  # Timestamp for TTL-based cleanup
+                ).model_dump()  # type: ignore[arg-type]
             )
 
         # delete previous docs for this source (check both original and actual URLs)
@@ -521,9 +546,9 @@ class IndexManager:
         if len(ids) > 0:
             # Infer format from sections structure
             format_hint = ""
-            if sections and "url" in sections[0]:
+            if sections and hasattr(sections[0], "url") and sections[0].url:
                 format_hint = " (standard-llms-txt: links)"
-            elif sections and sections[0].get("description"):
+            elif sections and sections[0].description:
                 format_hint = " (yaml-frontmatter)"
             else:
                 format_hint = " (standard-full)"
@@ -567,7 +592,7 @@ class IndexManager:
         # Parse query terms for snippet extraction
         query_terms = query.split() if include_snippets else []
 
-        for meta, dist in zip(metas, dists):
+        for meta, dist in zip(metas, dists, strict=False):
             score = max(0.0, 1.0 - float(dist))
 
             # Extract snippet if requested
@@ -593,10 +618,10 @@ class IndexManager:
 
     def get(
         self, ids: list[str], max_bytes: int | None, merge: bool
-    ) -> dict[str, Any] | list[DocContent]:
+    ) -> dict[str, str | list[DocContent]] | list[DocContent]:
         collection = self.ensure_collection()
         max_budget = int(max_bytes) if max_bytes is not None else self.max_get_bytes
-        results: list[dict[str, Any]] = []
+        results: list[DocContent] = []
         total = 0
         merged_content_parts: list[str] = []
 
@@ -723,6 +748,14 @@ async def get_sources() -> list[SourceInfo]:
 
 
 # -------------------------
+# Field constants (avoid B008 rule violations)
+# -------------------------
+
+_RETRIEVE_IDS_FIELD = Field(default=None, description="Specific document IDs to retrieve")
+_MAX_BYTES_FIELD = Field(default=None, description="Byte limit per retrieved document")
+_MERGE_FIELD = Field(default=False, description="Merge all retrieved content into single response")
+
+# -------------------------
 # Tools
 # -------------------------
 
@@ -797,13 +830,9 @@ async def docs_query(
     auto_retrieve_limit: int | None = Field(
         default=None, description="Max docs to auto-retrieve (default: 5)"
     ),
-    retrieve_ids: list[str] | None = Field(
-        default=None, description="Specific document IDs to retrieve"
-    ),
-    max_bytes: int | None = Field(default=None, description="Byte limit per retrieved document"),
-    merge: bool = Field(
-        default=False, description="Merge all retrieved content into single response"
-    ),
+    retrieve_ids: list[str] | None = _RETRIEVE_IDS_FIELD,
+    max_bytes: int | None = _MAX_BYTES_FIELD,
+    merge: bool = _MERGE_FIELD,
 ) -> QueryResult:
     """Search documentation with optional auto-retrieval. Combines search + get functionality."""
     global index_manager, config
@@ -933,7 +962,7 @@ def parse_args() -> argparse.Namespace:
 
 
 @asynccontextmanager
-async def managed_resources(cfg: Config):
+async def managed_resources(cfg: Config) -> AsyncIterator[None]:
     """Async context manager for managing all server resources."""
     global config, http_client, embedding_model, chroma_client, chroma_collection, index_manager
 
@@ -943,7 +972,7 @@ async def managed_resources(cfg: Config):
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"Invalid URL: {url}")
         # Support both llms.txt and llms-full.txt
-        if not (url.endswith("/llms.txt") or url.endswith("/llms-full.txt")):
+        if not (url.endswith(("/llms.txt", "/llms-full.txt"))):
             raise ValueError(f"URL must end with /llms.txt or /llms-full.txt: {url}")
 
     # Set global config
@@ -1103,11 +1132,11 @@ def main() -> None:
         background_preindex=not args.no_background_preindex,
     )
 
-    async def run_server():
+    async def run_server() -> None:
         """Run the server with managed resources."""
         shutdown_event = asyncio.Event()
 
-        def signal_handler(signum, _frame):
+        def signal_handler(signum: int, _frame: FrameType | None) -> None:
             """Simple signal handler."""
             logger.info(f"Received signal {signum}, shutting down...")
             shutdown_event.set()
@@ -1142,20 +1171,16 @@ def main() -> None:
                 if shutdown_task in done:
                     logger.info("Shutting down...")
                     server_task.cancel()
-                    try:
+                    with suppress(TimeoutError, asyncio.CancelledError):
                         await asyncio.wait_for(server_task, timeout=2.0)
-                    except (TimeoutError, asyncio.CancelledError):
-                        pass
             except Exception as e:
                 logger.error(f"Server error: {e}")
             finally:
                 # Cancel preindex task if still running
                 if preindex_task and not preindex_task.done():
                     preindex_task.cancel()
-                    try:
+                    with suppress(asyncio.CancelledError):
                         await preindex_task
-                    except asyncio.CancelledError:
-                        pass
 
     # Run the async server
     try:
