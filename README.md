@@ -51,8 +51,8 @@ Here's what happens when you try to get AI SDK documentation for building a chat
 ### llms-txt-mcp
 ```
 > Search for "chatbot" in AI SDK docs
-⏺ docs_search(query: "chatbot", limit: 5)
-  ⎿ Found 5 relevant sections (47 tokens)
+⏺ docs_query(query: "chatbot", limit: 5, auto_retrieve: false)
+  ⎿ Found 5 relevant sections (≈50 tokens)
 ```
 **Result:** <100 tokens
 
@@ -84,8 +84,8 @@ llms-txt:   [▪] <100 tokens
 uvx llms-txt-mcp https://ai-sdk.dev/llms.txt
 
 # Or install from source
-git clone https://github.com/yourusername/llms-txt-mcp.git
-cd llms-txt-mcp && uv sync
+git clone https://github.com/tenequm/llms-mcp-txt.git
+cd llms-mcp-txt && uv sync
 uv run llms-txt-mcp https://ai-sdk.dev/llms.txt
 ```
 
@@ -115,7 +115,7 @@ URL → Parse YAML/Markdown → Embed → Search → Get Section
 **Key insight:** Search first, fetch later. Never dump entire documentation.
 
 1. **Parse**: Handles both AI SDK's YAML frontmatter and standard markdown
-2. **Index**: Embeds sections with lightweight all-MiniLM-L6-v2 (22MB)
+2. **Index**: Embeds sections with `BAAI/bge-small-en-v1.5`
 3. **Search**: Semantic search returns top-k results (default: 10)
 4. **Get**: Fetch exactly what you need with byte-capped responses
 
@@ -128,7 +128,7 @@ URL → Parse YAML/Markdown → Embed → Search → Get Section
 
 ### 🎯 Surgical Access
 - Search first - find relevant sections without dumping everything
-- Byte-capped responses - protect your context window (default: 100KB)
+- Byte-capped responses - protect your context window (default: 75KB)
 - Human-readable IDs - use canonical URLs like `https://ai-sdk.dev/llms.txt#rag-agent`
 
 ### 📦 Zero Config Required
@@ -154,30 +154,35 @@ uvx llms-txt-mcp https://ai-sdk.dev/llms.txt https://nextjs.org/llms.txt
 
 ### Search Documentation
 ```typescript
-// In Claude Code
-await docs_search({ 
+// In Claude Code (search only)
+await docs_query({ 
   query: "RAG agent", 
-  limit: 5 
+  limit: 5,
+  auto_retrieve: false
 })
 
-// Returns tiny, focused results:
-[
-  {
-    id: "https://ai-sdk.dev/llms.txt#rag-agent",
-    title: "RAG Agent",
-    snippet: "Build a RAG agent with...",
-    score: 0.92
-  }
-]
+// Returns tiny, focused results without content
 ```
 
-### Get Specific Section
+### Retrieve Specific Sections
 ```typescript
-await docs_get({ 
-  ids: ["https://ai-sdk.dev/llms.txt#rag-agent"] 
+// Auto-retrieve top matches (recommended)
+await docs_query({
+  query: "RAG agent",
+  limit: 5,
+  auto_retrieve: true,
+  max_bytes: 75000,
+  merge: false
 })
 
-// Returns just that section, not 25K lines
+// Or retrieve explicit IDs
+await docs_query({
+  retrieve_ids: [
+    "https://ai-sdk.dev/llms.txt#rag-agent-000"
+  ],
+  max_bytes: 75000,
+  merge: false
+})
 ```
 
 ### List Available Sources
@@ -212,11 +217,14 @@ uvx llms-txt-mcp https://ai-sdk.dev/llms.txt \
 
 ### Advanced Flags
 - `--parallel-preindex N` - Index N sources concurrently (default: 3)
-- `--max-get-bytes N` - Byte limit for responses (default: 70000)
+- `--max-get-bytes N` - Byte limit for responses (default: 75000)
 - `--embed-model MODEL` - Change embedding model (default: BAAI/bge-small-en-v1.5)
-- `--no-lazy-embed` - Load model immediately
+- `--prefer-full` - Prefer `llms-full.txt` over `llms.txt` when available
+- `--no-lazy-embed` - Load embedding model immediately
 - `--no-smart-preindex` - Always reindex everything
 - `--no-background-preindex` - Wait for indexing to complete
+
+Note: The default `max-get-bytes` is 75KB. In practice, going 80KB+ can push responses close to a 25,000-token cap in some clients, so 75KB is a safe default.
 
 ## Performance
 
@@ -251,18 +259,18 @@ Handles 30K+ line files without breaking
 
 ### Setup
 ```bash
-git clone https://github.com/yourusername/llms-txt-mcp.git
-cd llms-txt-mcp
+git clone https://github.com/tenequm/llms-mcp-txt.git
+cd llms-mcp-txt
 uv sync --all-extras
 ```
 
 ### Development Workflow
 ```bash
 # Run the tool
-uv run llms-txt-mcp-dev --version
+uv run llms-txt-mcp --version
 
 # Run from anywhere
-uv run --directory /path/to/llms-txt-mcp llms-txt-mcp-dev --version
+uv run --directory /path/to/llms-mcp-txt llms-txt-mcp --version
 
 # Development commands
 uv run pytest                    # Run tests
@@ -271,19 +279,19 @@ uv run ruff format .            # Format code
 uv run mypy src/                # Type check
 
 # With arguments
-uv run llms-txt-mcp-dev https://ai-sdk.dev/llms.txt --preindex
+uv run llms-txt-mcp https://ai-sdk.dev/llms.txt --preindex
 ```
 
 ### Shell Integration
 ```bash
-llms-dev() {
-    uv run --directory /path/to/llms-txt-mcp llms-txt-mcp-dev "$@"
+llms() {
+    uv run --directory /path/to/llms-mcp-txt llms-txt-mcp "$@"
 }
 ```
 
 ### Local Testing with Inspector
 ```bash
-npx @modelcontextprotocol/inspector uv run llms-txt-mcp-dev https://ai-sdk.dev/llms.txt
+npx @modelcontextprotocol/inspector uv run llms-txt-mcp https://ai-sdk.dev/llms.txt
 ```
 
 ## Architecture

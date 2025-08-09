@@ -7,6 +7,21 @@
     "Context7": {
       "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "llms-txt-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/tenequm/Projects/llms-txt-mcp",
+        "llms-txt-mcp",
+        "https://ai-sdk.dev/llms.txt",
+        "https://vercel.com/docs/llms.txt",
+        "https://nextjs.org/docs/llms.txt",
+        "https://hono.dev/llms-full.txt",
+        "https://orm.drizzle.team/llms-full.txt",
+        "https://zod.dev/llms.txt"
+      ]
     }
   }
 }

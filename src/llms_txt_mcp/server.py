@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import re
 import time
@@ -39,6 +40,7 @@ from urllib.parse import urlparse
 
 try:
     from importlib.metadata import version
+
     __version__ = version("llms-txt-mcp")
 except ImportError:
     # Fallback for development/editable installs
@@ -188,6 +190,7 @@ index_manager_var: ContextVar[IndexManager | None] = ContextVar("index_manager",
 auto_retrieve_threshold_var: ContextVar[float] = ContextVar("auto_retrieve_threshold", default=0.1)
 auto_retrieve_limit_var: ContextVar[int] = ContextVar("auto_retrieve_limit", default=5)
 include_snippets_var: ContextVar[bool] = ContextVar("include_snippets", default=True)
+prefer_full_var: ContextVar[bool] = ContextVar("prefer_full", default=False)
 
 
 # Getter functions for context variables
@@ -233,6 +236,10 @@ def get_auto_retrieve_limit() -> int:
 
 def get_include_snippets() -> bool:
     return include_snippets_var.get()
+
+
+def get_prefer_full() -> bool:
+    return prefer_full_var.get()
 
 
 # -------------------------
@@ -291,8 +298,6 @@ def get_content_hash(content: str, max_bytes: int = 1024) -> str:
     Uses MD5 hash of first max_bytes for performance.
     This is NOT for security, just for change detection.
     """
-    import hashlib
-
     sample = content[:max_bytes].encode("utf-8")
     return hashlib.md5(sample).hexdigest()[:12]  # 12 chars is enough for our use case
 
@@ -488,11 +493,112 @@ def parse_official_headings(content: str) -> list[dict[str, Any]]:
     return sections
 
 
+def parse_link_list(content: str) -> list[dict[str, Any]]:
+    """Parse link-list format (e.g., Claude docs with - [title](url): description)."""
+    lines = content.splitlines()
+    sections: list[dict[str, Any]] = []
+    in_docs_section = False
+
+    for line in lines:
+        # Look for ## Docs section
+        if line.strip() == "## Docs":
+            in_docs_section = True
+            continue
+
+        # Stop at next heading
+        if in_docs_section and line.strip().startswith("#"):
+            break
+
+        # Parse link lines
+        if in_docs_section and line.strip().startswith("- ["):
+            # Match patterns like: - [Title](url): Description
+            # or: - [Title](url)
+            match = re.match(r"^- \[([^\]]+)\]\(([^)]+)\)(?:\s*:\s*(.+))?$", line.strip())
+            if match:
+                title = match.group(1).strip()
+                url = match.group(2).strip()
+                description = match.group(3).strip() if match.group(3) else ""
+
+                sections.append(
+                    {
+                        "title": title,
+                        "description": description,
+                        "tags": [],
+                        "content": f"Documentation available at: {url}\n\n{description}"
+                        if description
+                        else f"Documentation available at: {url}",
+                    }
+                )
+
+    return sections
+
+
+def parse_separator_sections(content: str) -> list[dict[str, Any]]:
+    """Parse content with --- separators (not YAML frontmatter)."""
+    # Split by lines that are just "---" (with optional whitespace)
+    parts = re.split(r"^---\s*$", content, flags=re.MULTILINE)
+
+    sections: list[dict[str, Any]] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        lines = part.splitlines()
+        if not lines:
+            continue
+
+        # First non-empty line is the title
+        title = ""
+        content_lines = []
+        found_title = False
+
+        for line in lines:
+            if not found_title and line.strip():
+                # Remove leading # if present
+                title = line.strip().lstrip("#").strip()
+                found_title = True
+            elif found_title:
+                content_lines.append(line)
+
+        if title:
+            sections.append(
+                {
+                    "title": title,
+                    "description": "",
+                    "tags": [],
+                    "content": "\n".join(content_lines).strip(),
+                }
+            )
+
+    return sections
+
+
 def parse_llms_text(content: str) -> list[dict[str, Any]]:
+    """Try all parsers in order and return first non-empty result."""
+    # Try YAML frontmatter first (AI SDK style)
     sections = parse_yaml_blocks(content)
     if sections:
         return sections
-    return parse_official_headings(content)
+
+    # Try link list format (Claude docs style)
+    sections = parse_link_list(content)
+    if sections:
+        return sections
+
+    # Try official heading format (MCP/llmstxt.org style)
+    sections = parse_official_headings(content)
+    if sections:
+        return sections
+
+    # Try separator format (llms-full.txt style)
+    sections = parse_separator_sections(content)
+    if sections:
+        return sections
+
+    # Fallback: treat entire content as single section
+    return [{"title": "Documentation", "description": "", "tags": [], "content": content.strip()}]
 
 
 # -------------------------
@@ -578,29 +684,109 @@ class IndexManager:
     async def _fetch_and_parse_sections(
         self, url: str, etag: str | None, last_modified: str | None
     ) -> tuple[int, list[dict[str, Any]], str | None, str | None]:
+        """Fetch and parse llms.txt with auto-discovery for llms-full.txt."""
         headers: dict[str, str] = {}
         if etag:
             headers["If-None-Match"] = etag
         if last_modified:
             headers["If-Modified-Since"] = last_modified
 
-        lines_iter, hdrs = await self._stream_lines(url, headers)
+        # Determine URLs to try based on preference
+        urls_to_try = []
+        base_url = url.replace("/llms.txt", "")
 
-        # Collect all lines from the stream
-        all_lines: list[str] = []
-        async for line in lines_iter:
-            all_lines.append(line)
+        if get_prefer_full():
+            # Try llms-full.txt first if prefer_full is enabled
+            urls_to_try.append(f"{base_url}/llms-full.txt")
+            urls_to_try.append(url)
+        else:
+            # Standard behavior: try llms.txt first
+            urls_to_try.append(url)
 
-        # Parse the complete content using the already-fixed parse_llms_text
-        full_content = "\n".join(all_lines)
-        sections = parse_llms_text(full_content)
+        sections = []
+        final_etag = None
+        final_last_mod = None
 
-        return 200, sections, hdrs.get("ETag"), hdrs.get("Last-Modified")
+        for try_url in urls_to_try:
+            try:
+                lines_iter, hdrs = await self._stream_lines(
+                    try_url, headers if try_url == url else {}
+                )
+
+                # Collect all lines from the stream
+                all_lines: list[str] = []
+                async for line in lines_iter:
+                    all_lines.append(line)
+
+                if not all_lines:
+                    continue
+
+                # Parse the complete content
+                full_content = "\n".join(all_lines)
+                parsed_sections = parse_llms_text(full_content)
+
+                # Check if we got only links and should try llms-full.txt
+                if (
+                    try_url == url
+                    and not get_prefer_full()
+                    and len(parsed_sections) > 0
+                    and all(
+                        "Documentation available at:" in sec.get("content", "")
+                        for sec in parsed_sections[:5]
+                    )
+                ):
+                    # This looks like a link-only file, try llms-full.txt
+                    full_url = f"{base_url}/llms-full.txt"
+                    try:
+                        full_lines_iter, full_hdrs = await self._stream_lines(full_url, {})
+                        full_lines = []
+                        async for line in full_lines_iter:
+                            full_lines.append(line)
+
+                        if full_lines:
+                            full_parsed = parse_llms_text("\n".join(full_lines))
+                            if full_parsed and len(full_parsed) > len(parsed_sections):
+                                # Use the full version if it has more content
+                                sections = full_parsed
+                                final_etag = full_hdrs.get("ETag")
+                                final_last_mod = full_hdrs.get("Last-Modified")
+                                logger.info(f"Auto-discovered richer content at {full_url}")
+                                break
+                    except Exception:
+                        # llms-full.txt doesn't exist or failed, use original
+                        pass
+
+                # Use the parsed sections
+                sections = parsed_sections
+                final_etag = hdrs.get("ETag")
+                final_last_mod = hdrs.get("Last-Modified")
+                break
+
+            except Exception as e:
+                if try_url == urls_to_try[-1]:
+                    # Last URL failed, re-raise
+                    raise
+                # Try next URL
+                logger.debug(f"Failed to fetch {try_url}: {e}")
+                continue
+
+        return 200, sections, final_etag, final_last_mod
 
     async def _index_source(self, source_url: str, prior: SourceState | None) -> None:
-        code, sections, etag, last_mod = await self._fetch_and_parse_sections(
-            source_url, prior.etag if prior else None, prior.last_modified if prior else None
-        )
+        try:
+            code, sections, etag, last_mod = await self._fetch_and_parse_sections(
+                source_url, prior.etag if prior else None, prior.last_modified if prior else None
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Source not found (404): {source_url}")
+                return
+            else:
+                logger.error(f"HTTP error fetching {source_url}: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Error indexing {source_url}: {e}")
+            raise
         if code == 304 and prior:
             self.sources[source_url] = dataclasses.replace(prior, last_indexed=time.time())
             return
@@ -671,9 +857,13 @@ class IndexManager:
             doc_count=len(ids),
         )
 
-    def search(
-        self, query: str, limit: int, include_snippets: bool = True
-    ) -> list[dict[str, Any]]:
+        # Log indexing results
+        if len(ids) > 0:
+            logger.info(f"Indexed {len(ids)} sections from {source_url}")
+        else:
+            logger.warning(f"No sections found in {source_url}")
+
+    def search(self, query: str, limit: int, include_snippets: bool = True) -> list[dict[str, Any]]:
         collection = self.ensure_collection()
         embedding_model = get_embedding_model()
         if embedding_model is None:
@@ -866,9 +1056,7 @@ async def docs_query(
         await index.maybe_refresh(url)
 
     # Perform search
-    search_results = index.search(
-        query=query, limit=limit, include_snippets=include_snippets
-    )
+    search_results = index.search(query=query, limit=limit, include_snippets=include_snippets)
 
     # Parse query for interpretation
     query_terms = query.split()
@@ -937,11 +1125,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="llms-txt-mcp", description="Lean Documentation MCP via llms.txt"
     )
-    parser.add_argument(
-        "--version", "-v",
-        action="version",
-        version=f"%(prog)s {__version__}"
-    )
+    parser.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("sources", nargs="*", help="llms.txt URLs to index (positional)")
     parser.add_argument("--sources", dest="sources_flag", nargs="*", help="llms.txt URLs to index")
     parser.add_argument("--ttl", default="24h", help="Refresh cadence (e.g., 30m, 24h)")
@@ -949,7 +1133,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embed-model", default="BAAI/bge-small-en-v1.5", help="SentenceTransformers model id"
     )
-    parser.add_argument("--preindex", action="store_true", help="Pre-index on launch")
+    parser.add_argument(
+        "--no-preindex", action="store_true", help="Disable automatic pre-indexing on launch"
+    )
     parser.add_argument(
         "--no-smart-preindex",
         action="store_true",
@@ -976,7 +1162,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--store-path", default=None, help="Store path (required for --store=disk)")
     parser.add_argument(
-        "--max-get-bytes", type=int, default=70000, help="Default byte cap for document retrieval"
+        "--max-get-bytes", type=int, default=75000, help="Default byte cap for document retrieval"
+    )
+    parser.add_argument(
+        "--prefer-full",
+        action="store_true",
+        help="Prefer llms-full.txt over llms.txt when available",
     )
     parser.add_argument(
         "--auto-retrieve-threshold",
@@ -1009,6 +1200,7 @@ async def managed_resources(
     auto_retrieve_threshold: float = 0.1,
     auto_retrieve_limit: int = 5,
     include_snippets: bool = True,
+    prefer_full: bool = False,
 ):
     """Async context manager for managing all server resources."""
     # Validate and store URLs
@@ -1017,8 +1209,9 @@ async def managed_resources(
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"Invalid URL: {url}")
-        if not url.endswith("/llms.txt"):
-            raise ValueError(f"URL must end with /llms.txt: {url}")
+        # Support both llms.txt and llms-full.txt
+        if not (url.endswith("/llms.txt") or url.endswith("/llms-full.txt")):
+            raise ValueError(f"URL must end with /llms.txt or /llms-full.txt: {url}")
         allowed.add(url)
 
     # Set context variables
@@ -1030,10 +1223,13 @@ async def managed_resources(
     auto_retrieve_threshold_var.set(auto_retrieve_threshold)
     auto_retrieve_limit_var.set(auto_retrieve_limit)
     include_snippets_var.set(include_snippets)
+    prefer_full_var.set(prefer_full)
 
     # Initialize HTTP client
     http_client = httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True, headers={"User-Agent": "llms-txt-mcp/0.1.0"}
+        timeout=timeout,
+        follow_redirects=True,
+        headers={"User-Agent": f"llms-txt-mcp/{__version__}"},
     )
     http_client_var.set(http_client)
 
@@ -1080,9 +1276,12 @@ async def managed_resources(
         yield
     finally:
         # Cleanup resources
-        logger.info("Cleaning up resources...")
+        logger.debug("Cleaning up resources...")
         try:
-            await http_client.aclose()
+            # Add timeout to prevent hanging
+            await asyncio.wait_for(http_client.aclose(), timeout=2.0)
+        except TimeoutError:
+            logger.warning("HTTP client close timed out")
         except Exception as e:
             logger.error(f"Error closing HTTP client: {e}")
 
@@ -1112,7 +1311,7 @@ async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> Non
 
         async def index_one(url: str, idx: int):
             async with semaphore:
-                logger.info(f"Pre-indexing {url}")
+                logger.info(f"Fetching {url}...")
                 await index.maybe_refresh(url, force=True)
                 if ctx:
                     await ctx.report_progress(f"Indexed {idx}/{total}: {url}")
@@ -1124,12 +1323,23 @@ async def preindex_sources(ctx: Context | None = None, parallel: int = 1) -> Non
         for i, url in enumerate(list(allowed_urls), 1):
             if ctx:
                 await ctx.report_progress(f"Pre-indexing source {i}/{total}: {url}")
-            logger.info(f"Pre-indexing {url}")
+            logger.info(f"Fetching {url}...")
             await index.maybe_refresh(url, force=True)
+
+    # Calculate total documents indexed
+    total_docs = sum(st.doc_count for st in index.sources.values())
+    indexed_count = len([st for st in index.sources.values() if st.doc_count > 0])
 
     if ctx:
         await ctx.report_progress("Pre-indexing complete")
-    logger.info("Preindex complete in %.2fs", time.time() - start)
+
+    logger.info(
+        "Indexing complete: %d sections from %d/%d sources (%.1fs)",
+        total_docs,
+        indexed_count,
+        total,
+        time.time() - start,
+    )
 
 
 async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) -> None:
@@ -1161,7 +1371,7 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
 
         async def index_one(url: str, idx: int):
             async with semaphore:
-                logger.info(f"Indexing stale source: {url}")
+                logger.info(f"Fetching {url}...")
                 await index.maybe_refresh(url, force=True)
                 if ctx:
                     await ctx.report_progress(f"Updated {idx}/{len(to_index)}: {url}")
@@ -1173,12 +1383,22 @@ async def smart_preindex_sources(ctx: Context | None = None, parallel: int = 1) 
         for i, url in enumerate(to_index, 1):
             if ctx:
                 await ctx.report_progress(f"Updating {i}/{len(to_index)}: {url}")
-            logger.info(f"Indexing stale source: {url}")
+            logger.info(f"Fetching {url}...")
             await index.maybe_refresh(url, force=True)
+
+    # Calculate total documents indexed
+    total_docs = sum(st.doc_count for st in index.sources.values())
 
     if ctx:
         await ctx.report_progress("Smart preindex complete")
-    logger.info("Smart preindex complete in %.2fs", time.time() - start)
+
+    logger.info(
+        "Indexing complete: %d sections from %d/%d sources updated (%.1fs)",
+        total_docs,
+        len(to_index),
+        len(allowed_urls),
+        time.time() - start,
+    )
 
 
 def main() -> None:
@@ -1198,6 +1418,7 @@ def main() -> None:
         """Run the server with managed resources."""
         # Invert the no-* flags to get the actual settings
         lazy_embed = not args.no_lazy_embed
+        preindex = not args.no_preindex  # Preindex by default
         smart_preindex = not args.no_smart_preindex
         background_preindex = not args.no_background_preindex
 
@@ -1213,23 +1434,29 @@ def main() -> None:
             auto_retrieve_threshold=args.auto_retrieve_threshold,
             auto_retrieve_limit=args.auto_retrieve_limit,
             include_snippets=not args.no_snippets,
+            prefer_full=args.prefer_full,
         ):
+            # Log that server is ready immediately
+            logger.info(
+                "llms-txt-mcp ready. Waiting for MCP client on stdio. Press Ctrl+C to exit."
+            )
+
             # Handle preindexing based on flags
             preindex_task = None
 
-            if background_preindex and args.preindex:
+            if background_preindex and preindex:
                 # Start preindexing in background
                 if smart_preindex:
-                    logger.info("Starting smart preindex in background...")
+                    logger.info("Starting automatic indexing in background...")
                     preindex_task = asyncio.create_task(
                         smart_preindex_sources(parallel=args.parallel_preindex)
                     )
                 else:
-                    logger.info("Starting preindex in background...")
+                    logger.info("Starting full indexing in background...")
                     preindex_task = asyncio.create_task(
                         preindex_sources(parallel=args.parallel_preindex)
                     )
-            elif args.preindex:
+            elif preindex:
                 # Preindex synchronously
                 if smart_preindex:
                     await smart_preindex_sources(parallel=args.parallel_preindex)
@@ -1237,20 +1464,20 @@ def main() -> None:
                     await preindex_sources(parallel=args.parallel_preindex)
 
             try:
-                logger.info(
-                    "llms-txt-mcp ready. Waiting for MCP client on stdio. Press Ctrl+C to exit."
-                )
                 # Run the MCP server in a thread to avoid blocking the event loop
                 await asyncio.to_thread(mcp.run)
-            except KeyboardInterrupt:
-                logger.info("Shutting down (Ctrl+C)")
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info("Shutting down...")
+            except Exception as e:
+                logger.error(f"Server error: {e}")
             finally:
                 # Cancel background task if still running
                 if preindex_task and not preindex_task.done():
+                    logger.debug("Cancelling preindex task...")
                     preindex_task.cancel()
                     try:
-                        await preindex_task
-                    except asyncio.CancelledError:
+                        await asyncio.wait_for(preindex_task, timeout=1.0)
+                    except (TimeoutError, asyncio.CancelledError):
                         pass
 
     # Run the async server

@@ -308,7 +308,7 @@ class TestMCPTools:
             auto_retrieve_limit=None,
             retrieve_ids=None,
             max_bytes=None,
-            merge=False
+            merge=False,
         )
         assert hasattr(result, "search_results")
         assert hasattr(result, "retrieved_content")
@@ -340,7 +340,7 @@ class TestMCPTools:
             auto_retrieve_limit=None,
             retrieve_ids=None,
             max_bytes=None,
-            merge=True
+            merge=True,
         )
         assert hasattr(result, "search_results")
         assert hasattr(result, "merged_content")
@@ -360,7 +360,7 @@ class TestMCPTools:
                 auto_retrieve_limit=None,
                 retrieve_ids=None,
                 max_bytes=None,
-                merge=False
+                merge=False,
             )
             # Should have retrieved content as separate items
             assert len(result_no_merge.retrieved_content) > 0
