@@ -23,31 +23,21 @@ jobs:
       - run: uv python install 3.12
 
       - name: Install git-cliff
-        run: |
-          # Install git-cliff for changelog generation
-          curl -L https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-0.1.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          sudo mv git-cliff-*/git-cliff /usr/local/bin/
+        run: curl -L https://github.com/orhun/git-cliff/releases/download/v2.10.0/git-cliff-2.10.0-x86_64-unknown-linux-gnu.tar.gz | tar xz && sudo mv git-cliff-*/git-cliff /usr/local/bin/
           
       - name: Generate changelog
-        run: git-cliff --config pyproject.toml --output CHANGELOG.md
-          
-      - name: Commit updated changelog
+        id: changelog
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add CHANGELOG.md
-          if git diff --staged --quiet; then
-            echo "No changelog changes to commit"
-          else
-            git commit -m "chore: update changelog for ${{ github.ref_name }}"
-            git push
-          fi
+          CHANGELOG=$(git-cliff --config pyproject.toml --unreleased --strip all)
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG.md
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.content }}
+          generate_release_notes: false
           draft: false
           prerelease: false
 
