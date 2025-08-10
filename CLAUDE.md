@@ -29,32 +29,19 @@ def fetch_llms_txt(url: str) -> str:
 
 ## Commands
 
-**ALWAYS USE UV - Never pip, python -m, or virtualenv!**
+Use Make targets (they call uv under the hood):
 
 ```bash
-# Quick development with uv
-make check              # Run all checks (format, lint, test) 
-make fix                # Auto-fix issues and run checks
-
-# Individual tasks (all use uv internally)
-make format             # Format code with uv run ruff
-make lint               # Lint code with uv run ruff  
-make test               # Run tests with uv run pytest
-make type               # Type check with uv run mypy
-
-# Setup with uv
-make install            # uv sync dependencies
-make clean              # Clean cache files
-make help               # Show all commands
-
-# Direct uv commands for reference
-uv sync                 # Install/sync dependencies
-uv run pytest          # Run tests
-uv run ruff check .     # Lint code
-uv run ruff format .    # Format code  
-uv run mypy src/        # Type check
-uv build                # Build package
-uv publish              # Publish to PyPI
+make install      # Install deps (uv sync --all-extras)
+make check        # Format check, lint, type-check, tests
+make fix          # Auto-format and fix lint
+make format       # Format code (ruff)
+make lint         # Lint (ruff)
+make type         # Type check (mypy)
+make test         # Run tests (pytest)
+make test-fast    # Run tests skipping performance ones
+make clean        # Remove caches
+make help         # List commands
 ```
 
 ## Remember
