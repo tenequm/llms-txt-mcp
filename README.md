@@ -278,13 +278,6 @@ uv run mypy                     # Type check
 uv run llms-txt-mcp https://ai-sdk.dev/llms.txt
 ```
 
-### Shell Integration
-```bash
-llms() {
-    uv run --directory /path/to/llms-mcp-txt llms-txt-mcp "$@"
-}
-```
-
 ### Local Testing with Inspector
 ```bash
 npx @modelcontextprotocol/inspector uv run llms-txt-mcp https://ai-sdk.dev/llms.txt https://nextjs.org/docs/llms.txt https://hono.dev/llms.txt https://orm.drizzle.team/llms.txt https://zod.dev/llms.txt https://docs.docker.com/llms.txt
