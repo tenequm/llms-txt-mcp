@@ -14,6 +14,7 @@
         "run",
         "llms-txt-mcp",
         "--store-path", "tmp/mcp-data",
+        "https://ai-sdk.dev/llms.txt",
         "https://gofastmcp.com/llms.txt",
         "https://modelcontextprotocol.io/llms.txt"
       ]

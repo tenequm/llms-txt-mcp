@@ -145,15 +145,16 @@ async def server_setup(mock_http_client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("server_setup")
 class TestMCPTools:
     """Test MCP tool functionality."""
 
-    async def test_docs_sources(self, server_setup):
+    async def test_docs_sources(self):
         """Test sources listing."""
         sources = await docs_sources()
         assert isinstance(sources, list)
 
-    async def test_search_and_get(self, server_setup):
+    async def test_search_and_get(self):
         """Test search and retrieval using docs_query."""
         result = await docs_query(
             query="Section 1",
@@ -177,7 +178,7 @@ class TestMCPTools:
         if result.auto_retrieved_count > 0:
             assert len(result.retrieved_content) > 0
 
-    async def test_refresh(self, server_setup):
+    async def test_refresh(self):
         """Test manual refresh."""
         # Pass None explicitly since it's looking for a Field
         out = await docs_refresh(source=None)
@@ -185,7 +186,7 @@ class TestMCPTools:
         assert hasattr(out, "refreshed")
         assert isinstance(out.refreshed, list)
 
-    async def test_docs_get_with_merge(self, server_setup):
+    async def test_docs_get_with_merge(self):
         """Test docs_query with merge=True parameter."""
         # Use docs_query to search and get multiple sections
         result = await docs_query(

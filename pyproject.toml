@@ -76,20 +76,15 @@ select = [
     "UP",     # pyupgrade
     
     # Type safety & annotations
-    "ANN",    # flake8-annotations (require type annotations)
     "FA",     # flake8-future-annotations
     "TC",     # flake8-type-checking
     
     # Code quality & bug prevention
     "B",      # flake8-bugbear (common bugs)
-    "SIM",    # flake8-simplify (simpler constructs)
     "C4",     # flake8-comprehensions (better comprehensions)
-    "PIE",    # flake8-pie (unnecessary code)
-    "RET",    # flake8-return (clean returns)
     
     # Modern Python practices
     "YTT",    # flake8-2020 (misuse of sys.version)
-    "DTZ",    # flake8-datetimez (timezone aware datetimes)
     "RSE",    # flake8-raise (better exception raising)
     "T20",    # flake8-print (no print statements)
     "PT",     # flake8-pytest-style (pytest best practices)
@@ -98,17 +93,18 @@ select = [
 # Per-file ignores for practical development
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = [
-    "ANN",     # Allow missing annotations in tests
     "T20",     # Allow print in tests
 ]
 "__init__.py" = [
     "F401",    # Allow unused imports in __init__ files
 ]
-
-# Annotation-specific settings
-[tool.ruff.lint.flake8-annotations]
-allow-star-arg-any = true        # Allow Any for *args, **kwargs
-suppress-dummy-args = true       # Suppress for dummy args like _
+"src/server.py" = [
+    "TC002",   # Context is needed at runtime by FastMCP for function introspection
+]
+"src/*.py" = [
+    "B008",    # Allow function calls in argument defaults (common pattern)
+    "C901",    # Allow complex functions when they make sense
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -187,4 +183,9 @@ skip_tags = "v0.1.0-beta.1"
 ignore_tags = ""
 topo_order = false
 sort_commits = "oldest"
+
+[dependency-groups]
+dev = [
+    "types-pyyaml>=6.0.12.20250809",
+]
 

@@ -34,11 +34,11 @@ import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
     from types import FrameType
 
 try:
@@ -56,7 +56,7 @@ except ImportError:
 import chromadb
 import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.server import Context  # noqa: TC002
+from mcp.server.fastmcp.server import Context
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
@@ -84,16 +84,16 @@ logger = logging.getLogger("llms-txt-mcp")
 class ChromaMetadata(BaseModel):
     """Metadata stored in Chroma collection."""
 
-    id: str = Field(description="Unique document identifier")
-    source: str = Field(description="Source URL of the document")
-    host: str = Field(description="Host domain of the source")
-    title: str = Field(description="Document title")
-    description: str = Field(default="", description="Document description")
-    content: str = Field(description="Document content")
-    requested_url: str = Field(default="", description="Original requested URL")
-    content_hash: str = Field(default="", description="Content hash for change detection")
-    section_index: int = Field(default=0, description="Section index for ordering")
-    indexed_at: float = Field(default=0, description="Timestamp when indexed")
+    id: str
+    source: str
+    host: str
+    title: str
+    description: str = ""
+    content: str
+    requested_url: str = ""
+    content_hash: str = ""
+    section_index: int = 0
+    indexed_at: float = 0
 
 
 # -------------------------
@@ -138,51 +138,49 @@ class SourceState:
 class SourceInfo(BaseModel):
     """Information about an indexed documentation source."""
 
-    source_url: str = Field(description="URL of the llms.txt source")
-    host: str = Field(description="Host domain of the source")
-    lastIndexed: int = Field(description="Unix timestamp of last indexing")
-    docCount: int = Field(description="Number of documents from this source")
+    source_url: str
+    host: str
+    lastIndexed: int
+    docCount: int
 
 
 class SearchResult(BaseModel):
     """A single search result from semantic search."""
 
-    id: str = Field(description="Unique document identifier")
-    source: str = Field(description="Source URL of the document")
-    title: str = Field(description="Document title")
-    description: str = Field(default="", description="Document description")
-    score: float = Field(description="Similarity score (0-1)")
-    auto_retrieved: bool = Field(default=False, description="Whether content was auto-retrieved")
-    snippet: str = Field(default="", description="Relevant content snippet")
+    id: str
+    source: str
+    title: str
+    description: str = ""
+    score: float
+    auto_retrieved: bool = False
+    snippet: str = ""
 
 
 class DocContent(BaseModel):
     """Retrieved document content."""
 
-    id: str = Field(description="Unique document identifier")
-    source: str = Field(description="Source URL")
-    host: str = Field(description="Host domain")
-    title: str = Field(description="Document title")
-    content: str = Field(description="Full or truncated content")
+    id: str
+    source: str
+    host: str
+    title: str
+    content: str
 
 
 class RefreshResult(BaseModel):
     """Result of refreshing documentation sources."""
 
-    refreshed: list[str] = Field(description="URLs that were refreshed")
-    counts: dict[str, int] = Field(description="Document counts per source")
+    refreshed: list[str]
+    counts: dict[str, int]
 
 
 class QueryResult(BaseModel):
     """Combined search and retrieval result."""
 
-    search_results: list[SearchResult] = Field(description="Search results with scores")
-    retrieved_content: dict[str, DocContent] = Field(
-        default_factory=dict, description="Auto-retrieved document contents"
-    )
-    merged_content: str = Field(default="", description="Merged content if merge=true")
-    auto_retrieved_count: int = Field(default=0, description="Number of documents auto-retrieved")
-    total_results: int = Field(default=0, description="Total search results found")
+    search_results: list[SearchResult]
+    retrieved_content: dict[str, DocContent] = {}
+    merged_content: str = ""
+    auto_retrieved_count: int = 0
+    total_results: int = 0
 
 
 # -------------------------
@@ -193,7 +191,7 @@ class QueryResult(BaseModel):
 config: Config | None = None
 http_client: httpx.AsyncClient | None = None
 embedding_model: SentenceTransformer | None = None
-chroma_client: chromadb.Client | None = None
+chroma_client: chromadb.ClientAPI | None = None
 chroma_collection: chromadb.Collection | None = None
 index_manager: IndexManager | None = None
 
@@ -470,7 +468,7 @@ class IndexManager:
 
         ids: list[str] = []
         docs: list[str] = []
-        metadatas: list[ChromaMetadata] = []
+        metadatas: list[dict[str, str | int | float | bool | None]] = []
 
         for idx, sec in enumerate(sections):
             sec_title = sec.title or "Untitled"
@@ -496,7 +494,7 @@ class IndexManager:
                     ),  # Add content hash for change detection
                     section_index=idx,  # Add section index for ordering
                     indexed_at=time.time(),  # Timestamp for TTL-based cleanup
-                ).model_dump()  # type: ignore[arg-type]
+                ).model_dump()
             )
 
         # delete previous docs for this source (check both original and actual URLs)
@@ -505,13 +503,13 @@ class IndexManager:
             all_ids_to_delete = []
 
             # Check original URL
-            existing = collection.get(where={"source": source_url}, include=["ids"])  # type: ignore[arg-type]
+            existing = collection.get(where={"source": source_url}, include=["ids"])  # type: ignore
             if existing and existing.get("ids"):
                 all_ids_to_delete.extend(existing["ids"])
 
             # Check actual URL if different
             if actual_url != source_url:
-                existing_actual = collection.get(where={"source": actual_url}, include=["ids"])  # type: ignore[arg-type]
+                existing_actual = collection.get(where={"source": actual_url}, include=["ids"])  # type: ignore
                 if existing_actual and existing_actual.get("ids"):
                     all_ids_to_delete.extend(existing_actual["ids"])
 
@@ -528,8 +526,12 @@ class IndexManager:
 
         if ids:
             embeddings = embedding_model.encode(docs)
+            # Cast for ChromaDB which expects Mapping instead of dict
+            metadata_mappings = cast(
+                "list[Mapping[str, str | int | float | bool | None]]", metadatas
+            )
             collection.add(
-                ids=ids, documents=docs, embeddings=embeddings.tolist(), metadatas=metadatas
+                ids=ids, documents=docs, embeddings=embeddings.tolist(), metadatas=metadata_mappings
             )
 
         self.sources[source_url] = SourceState(
@@ -574,20 +576,25 @@ class IndexManager:
 
         # Query with filter for configured URLs
         # Documents can match either by requested_url (original) or source (actual)
+        # ChromaDB Where clause - the type hints don't properly support $or with $in
+        where_clause: Any = {
+            "$or": [
+                {"requested_url": {"$in": list(allowed_urls)}},
+                {"source": {"$in": list(allowed_urls)}},
+            ]
+        }
+
         res = collection.query(
             query_embeddings=query_embedding,
             n_results=min(max(limit, 1), 20),
-            where={
-                "$or": [
-                    {"requested_url": {"$in": list(allowed_urls)}},
-                    {"source": {"$in": list(allowed_urls)}},
-                ]
-            },
+            where=where_clause,
             include=["metadatas", "distances"],
         )  # type: ignore[arg-type]
         items: list[SearchResult] = []
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
+        metas_result = res.get("metadatas", [[]])
+        dists_result = res.get("distances", [[]])
+        metas = metas_result[0] if metas_result else []
+        dists = dists_result[0] if dists_result else []
 
         # Parse query terms for snippet extraction
         query_terms = query.split() if include_snippets else []
@@ -603,10 +610,10 @@ class IndexManager:
 
             items.append(
                 SearchResult(
-                    id=meta.get("id", ""),
-                    source=meta.get("source", ""),
-                    title=meta.get("title", ""),
-                    description=meta.get("description", ""),
+                    id=str(meta.get("id", "")),
+                    source=str(meta.get("source", "")),
+                    title=str(meta.get("title", "")),
+                    description=str(meta.get("description", "")),
                     score=round(score, 3),
                     auto_retrieved=False,  # Will be set by caller
                     snippet=snippet,
@@ -616,9 +623,7 @@ class IndexManager:
                 break
         return items
 
-    def get(
-        self, ids: list[str], max_bytes: int | None, merge: bool
-    ) -> dict[str, str | list[DocContent]] | list[DocContent]:
+    def get(self, ids: list[str], max_bytes: int | None, merge: bool) -> dict[str, Any]:
         collection = self.ensure_collection()
         max_budget = int(max_bytes) if max_bytes is not None else self.max_get_bytes
         results: list[DocContent] = []
@@ -650,13 +655,13 @@ class IndexManager:
                 merged_content_parts.append(contribution)
             else:
                 results.append(
-                    {
-                        "id": cid,
-                        "source": source,
-                        "host": host,
-                        "title": title,
-                        "content": contribution,
-                    }
+                    DocContent(
+                        id=cid,
+                        source=source,
+                        host=host,
+                        title=title,
+                        content=contribution,
+                    )
                 )
             if total >= max_budget:
                 break
@@ -697,9 +702,14 @@ class IndexManager:
             indexed_at = meta.get("indexed_at", 0)
 
             if doc_id and requested_url:
-                if requested_url not in docs_by_source:
-                    docs_by_source[requested_url] = []
-                docs_by_source[requested_url].append((doc_id, indexed_at))
+                # Ensure types are correct
+                doc_id_str = str(doc_id)
+                requested_url_str = str(requested_url)
+                indexed_at_float = float(indexed_at) if indexed_at else 0.0
+
+                if requested_url_str not in docs_by_source:
+                    docs_by_source[requested_url_str] = []
+                docs_by_source[requested_url_str].append((doc_id_str, indexed_at_float))
 
         # Find expired documents from unconfigured sources
         ids_to_delete = []
@@ -751,9 +761,9 @@ async def get_sources() -> list[SourceInfo]:
 # Field constants (avoid B008 rule violations)
 # -------------------------
 
-_RETRIEVE_IDS_FIELD = Field(default=None, description="Specific document IDs to retrieve")
-_MAX_BYTES_FIELD = Field(default=None, description="Byte limit per retrieved document")
-_MERGE_FIELD = Field(default=False, description="Merge all retrieved content into single response")
+_RETRIEVE_IDS_FIELD = Field(default=None)
+_MAX_BYTES_FIELD = Field(default=None)
+_MERGE_FIELD = Field(default=False)
 
 # -------------------------
 # Tools
@@ -780,9 +790,7 @@ async def docs_sources() -> list[SourceInfo]:
 
 @mcp.tool()
 async def docs_refresh(
-    source: str | None = Field(
-        default=None, description="Specific source URL to refresh, or None for all"
-    ),
+    source: str | None = None,
     ctx: Context | None = None,
 ) -> RefreshResult:
     """Force refresh cached documentation."""
@@ -797,19 +805,21 @@ async def docs_refresh(
         if source not in allowed_urls:
             raise ValueError("Source not allowed")
         if ctx:
-            await ctx.report_progress(f"Refreshing {source}...")
+            await ctx.report_progress(0.5, 1.0, f"Refreshing {source}...")
         await index_manager.maybe_refresh(source, force=True)
         refreshed.append(source)
     else:
         total = len(allowed_urls)
         for i, url in enumerate(list(allowed_urls), 1):
             if ctx:
-                await ctx.report_progress(f"Refreshing source {i}/{total}: {url}")
+                await ctx.report_progress(
+                    float(i - 1) / total, float(total), f"Refreshing source {i}/{total}: {url}"
+                )
             await index_manager.maybe_refresh(url, force=True)
             refreshed.append(url)
 
     if ctx:
-        await ctx.report_progress("Refresh complete")
+        await ctx.report_progress(1.0, 1.0, "Refresh complete")
 
     return RefreshResult(
         refreshed=refreshed,
@@ -822,14 +832,10 @@ async def docs_refresh(
 @mcp.tool()
 async def docs_query(
     query: str = Field(description="Search query text"),
-    limit: int = Field(default=10, description="Maximum number of search results"),
-    auto_retrieve: bool = Field(default=True, description="Auto-retrieve top relevant results"),
-    auto_retrieve_threshold: float | None = Field(
-        default=None, description="Min score for auto-retrieve (default: 0.1)"
-    ),
-    auto_retrieve_limit: int | None = Field(
-        default=None, description="Max docs to auto-retrieve (default: 5)"
-    ),
+    limit: int = 10,
+    auto_retrieve: bool = True,
+    auto_retrieve_threshold: float | None = None,
+    auto_retrieve_limit: int | None = None,
     retrieve_ids: list[str] | None = _RETRIEVE_IDS_FIELD,
     max_bytes: int | None = _MAX_BYTES_FIELD,
     merge: bool = _MERGE_FIELD,
@@ -882,18 +888,13 @@ async def docs_query(
     merged_content = ""
 
     if ids_to_retrieve:
-        result = index_manager.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
-        if merge and result.get("merged"):
-            merged_content = result["content"]
+        get_result = index_manager.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
+        if merge and get_result.get("merged"):
+            merged_content = get_result["content"]
         else:
-            for item in result.get("items", []):
-                retrieved_content[item["id"]] = DocContent(
-                    id=item["id"],
-                    source=item["source"],
-                    host=item["host"],
-                    title=item["title"],
-                    content=item["content"],
-                )
+            for item in get_result.get("items", []):
+                # item is already a DocContent object
+                retrieved_content[item.id] = item
 
     return QueryResult(
         search_results=search_results,
@@ -998,6 +999,7 @@ async def managed_resources(cfg: Config) -> AsyncIterator[None]:
     # Initialize Chroma
     if cfg.store_mode == "disk":
         # store_path is guaranteed to exist when store="disk" due to auto-detection logic
+        assert cfg.store_path is not None, "store_path must be set when store_mode is 'disk'"
         if ChromaSettings is not None:
             chroma_client = chromadb.PersistentClient(
                 path=cfg.store_path, settings=ChromaSettings(anonymized_telemetry=False)

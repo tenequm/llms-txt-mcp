@@ -4,26 +4,26 @@ from __future__ import annotations
 
 import re
 
-import yaml  # type: ignore[import-untyped]
-from pydantic import BaseModel, Field
+import yaml
+from pydantic import BaseModel
 
 
 class ParsedDoc(BaseModel):
     """Structure for parsed document sections."""
 
-    title: str = Field(description="Document title")
-    description: str = Field(default="", description="Document description")
-    content: str = Field(default="", description="Document content")
-    url: str = Field(default="", description="Document URL (for standard format)")
-    original_title: str = Field(default="", description="Original title from source")
-    section: str = Field(default="", description="Section name (for standard format)")
+    title: str
+    description: str = ""
+    content: str = ""
+    url: str = ""
+    original_title: str = ""
+    section: str = ""
 
 
 class ParseResult(BaseModel):
     """Result from parsing llms.txt files."""
 
-    docs: list[ParsedDoc] = Field(description="List of parsed documents")
-    format: str = Field(description="Detected format type")
+    docs: list[ParsedDoc]
+    format: str
 
 
 def detect_format(content: str) -> str:
@@ -268,7 +268,7 @@ def _parse_standard_full(content: str) -> dict[str, list[ParsedDoc]]:
     lines = content.strip().split("\n")
 
     current_article = None
-    current_content = []
+    current_content: list[str] = []
 
     for line in lines:
         # Match top-level headers (# Title)

@@ -8,6 +8,7 @@ help: ## Show this help message
 check: ## Run all checks (format, lint, test)
 	@uv run ruff format --check .
 	@uv run ruff check .
+	@uv run mypy src/
 	@uv run pytest
 
 fix: ## Auto-fix format and lint issues, then run checks

@@ -28,7 +28,7 @@ AI SDK's documentation ([ai-sdk.dev/llms.txt](https://ai-sdk.dev/llms.txt)) brea
 
 Here's what happens when you try to get AI SDK documentation for building a chatbot:
 
-### mcpdoc: Complete Failure
+### mcpdoc: Token Limit Exceeded
 ```
 > use mcpdoc to get ai-sdk documentation on how to build chatbot app
 
@@ -37,7 +37,7 @@ Here's what happens when you try to get AI SDK documentation for building a chat
     allowed tokens (25,000). Please use pagination, filtering, or limit 
     parameters to reduce the response size.
 ```
-**Result:** 251,431 tokens attempted → Complete failure
+**Result:** 251,431 tokens attempted → Token limit exceeded
 
 ### Context7: Drowning in Noise
 ```
@@ -65,7 +65,7 @@ Built to solve the problem of large documentation files timing out or consuming 
 | Operation | mcpdoc | Context7 | llms-txt-mcp |
 |-----------|--------|----------|--------------|
 | AI SDK Chatbot Docs | 251,431 tokens → ERROR | 15,000 tokens | <100 tokens |
-| Structure Discovery | 5+ seconds | 2-3 seconds | <200ms |
+| Structure Discovery | 5+ seconds | 2-3 seconds | Fast |
 | Context Usage | Fails completely | 15K tokens | 50 tokens |
 | Large File Support | Timeouts | Truncates | Streams |
 | AI SDK llms.txt (30K+ lines) | Fails | Partial | 132 sections |
@@ -122,8 +122,8 @@ URL → Parse YAML/Markdown → Embed → Search → Get Section
 ## Features
 
 ### 🚀 Instant Startup
-- Lazy model loading - server ready in <1 second
-- Smart preindexing - only updates stale sources
+- Lazy model loading for fast server startup
+- Preindexing with stale source detection
 - Background indexing - server available immediately
 
 ### 🎯 Surgical Access
@@ -210,19 +210,15 @@ uvx llms-txt-mcp https://ai-sdk.dev/llms.txt
 ```bash
 uvx llms-txt-mcp https://ai-sdk.dev/llms.txt \
   --ttl 1h                    # Refresh every hour
-  --preindex                  # Index on startup
   --store disk                # Persist embeddings
   --store-path ~/.llms-cache # Cache location
 ```
 
 ### Advanced Flags
-- `--parallel-preindex N` - Index N sources concurrently (default: 3)
 - `--max-get-bytes N` - Byte limit for responses (default: 75000)
 - `--embed-model MODEL` - Change embedding model (default: BAAI/bge-small-en-v1.5)
-- `--prefer-full` - Prefer `llms-full.txt` over `llms.txt` when available
-- `--no-lazy-embed` - Load embedding model immediately
-- `--no-smart-preindex` - Always reindex everything
-- `--no-background-preindex` - Wait for indexing to complete
+- `--no-preindex` - Disable automatic pre-indexing on startup
+- `--no-background-preindex` - Wait for indexing to complete before serving
 
 Note: The default `max-get-bytes` is 75KB. In practice, going 80KB+ can push responses close to a 25,000-token cap in some clients, so 75KB is a safe default.
 
@@ -232,18 +228,18 @@ Note: The default `max-get-bytes` is 75KB. In practice, going 80KB+ can push res
 
 | Metric | Performance |
 |--------|------------|
-| Parse time | <200ms |
-| Index time (first run) | ~2s |
-| Index time (cached) | 0ms |
-| Search latency | <50ms |
-| Memory usage | <150MB |
-| Model size | 22MB |
+| Parse time | Fast (<2s for 30K+ lines) |
+| Index time (first run) | Fast initial indexing |
+| Index time (cached) | Instant (0ms) |
+| Search latency | Fast semantic search |
+| Memory usage | Lightweight |
+| Model size | Small embedding model |
 
 **Test Results:**
 ```
-18 tests passing
-25x+ faster structure discovery verified
-30x smaller context usage confirmed
+17 tests passing
+Fast parsing performance verified
+Minimal context usage confirmed
 Handles 30K+ line files without breaking
 ```
 
@@ -279,7 +275,7 @@ uv run ruff format .            # Format code
 uv run mypy                     # Type check
 
 # With arguments
-uv run llms-txt-mcp https://ai-sdk.dev/llms.txt --preindex
+uv run llms-txt-mcp https://ai-sdk.dev/llms.txt
 ```
 
 ### Shell Integration
