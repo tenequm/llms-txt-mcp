@@ -132,13 +132,24 @@ async def server_setup(mock_http_client):
     )
 
     # Use the new managed_resources context manager
-    async with managed_resources(test_config):
-        # Replace HTTP client with mock
-        server_mod.http_client = mock_http_client
+    async with managed_resources(test_config) as rm:
+        # Set the global resource manager for tools to access
+        server_mod.resource_manager = rm
+
+        # Replace the HTTP client in the ResourceManager with our mock
+        original_http_client = rm.http_client
+        rm.http_client = mock_http_client
+
+        # Wait for resources to be initialized
+        await rm.ensure_ready(timeout=30.0)
 
         yield
 
+        # Restore original HTTP client
+        rm.http_client = original_http_client
+
     # Cleanup happens automatically via context manager
+    server_mod.resource_manager = None
 
 
 # Removed legacy cache tests; new implementation uses TTL/ETag on network + Chroma storage.
