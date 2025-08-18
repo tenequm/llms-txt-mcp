@@ -28,6 +28,7 @@ import asyncio
 import dataclasses
 import hashlib
 import logging
+import os
 import re
 import signal
 import sys
@@ -60,6 +61,14 @@ from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
 from .parser import ParsedDoc, parse_llms_txt
+
+try:
+    import anthropic
+
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    anthropic = None  # type: ignore
 
 try:
     # Chroma telemetry settings (0.5+)
@@ -122,6 +131,7 @@ class Config:
     include_snippets: bool
     preindex: bool
     background_preindex: bool
+    max_response_tokens: int
 
 
 @dataclass
@@ -186,6 +196,8 @@ class QueryResult(BaseModel):
     merged_content: str = ""
     auto_retrieved_count: int = 0
     total_results: int = 0
+    total_tokens: int | None = None
+    truncated_due_to_tokens: bool = False
 
 
 # -------------------------
@@ -390,6 +402,10 @@ DEFAULT_AUTO_RETRIEVE_THRESHOLD = 0.1  # Default score threshold for auto-retrie
 DEFAULT_AUTO_RETRIEVE_LIMIT = 5  # Default max number of docs to auto-retrieve
 DEFAULT_TTL_HOURS = 24  # Default TTL for cached documents
 DEFAULT_HTTP_TIMEOUT = 30  # Default HTTP request timeout in seconds
+DEFAULT_MAX_RESPONSE_TOKENS = 25000  # Default max tokens in MCP response
+# Reserve 1000 tokens for JSON structure, metadata fields, and response formatting
+# This ensures the actual content + JSON wrapper stays under Claude's context limit
+TOKEN_LIMIT_BUFFER = 1000  # Buffer to account for JSON structure overhead
 
 # Display constants
 SUMMARY_SEPARATOR = "=" * 60  # Separator for summary displays
@@ -433,6 +449,60 @@ def _ensure_resource_manager() -> ResourceManager:
             "is still starting up or there was an initialization error."
         )
     return resource_manager
+
+
+# -------------------------
+# Token Counting
+# -------------------------
+
+
+class TokenCounter:
+    """Utility class for counting tokens using Anthropic's API."""
+
+    def __init__(self, model: str = "claude-3-5-sonnet-20241022"):
+        """Initialize the token counter.
+
+        Args:
+            model: The Claude model to use for tokenization.
+        """
+        self.model = model
+        self.client: anthropic.Anthropic | None = None
+        self.enabled = ANTHROPIC_AVAILABLE
+
+        if self.enabled:
+            try:
+                # API key is optional for token counting
+                # Will use ANTHROPIC_API_KEY env var if set
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "dummy-key-for-counting")
+                self.client = anthropic.Anthropic(api_key=api_key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize Anthropic client for token counting: {e}")
+                self.enabled = False
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in the given text.
+
+        Args:
+            text: The text to count tokens for.
+
+        Returns:
+            Number of tokens, or 0 if counting fails.
+        """
+        if not self.enabled or not self.client:
+            # Fallback: rough estimate based on character count
+            # Approximation: ~4 chars per token for English text
+            return len(text) // 4
+
+        try:
+            response = self.client.messages.count_tokens(
+                model=self.model, messages=[{"role": "user", "content": text}]
+            )
+            # The response contains input_tokens field
+            return response.input_tokens
+        except Exception as e:
+            logger.debug(f"Token counting failed, using estimate: {e}")
+            # Fallback to rough estimate
+            return len(text) // 4
 
 
 # -------------------------
@@ -537,6 +607,7 @@ class IndexManager:
         self.config = config
         self.chroma_collection: chromadb.Collection | None = None
         self.sources: dict[str, SourceState] = {}
+        self.token_counter = TokenCounter()
 
     def ensure_collection(self) -> chromadb.Collection:
         if self.chroma_collection is None:
@@ -852,12 +923,23 @@ class IndexManager:
                 break
         return items
 
-    def get(self, ids: list[str], max_bytes: int | None, merge: bool) -> dict[str, Any]:
+    def get(
+        self, ids: list[str], max_bytes: int | None, merge: bool, max_tokens: int | None = None
+    ) -> dict[str, Any]:
         collection = self.ensure_collection()
         max_budget = int(max_bytes) if max_bytes is not None else self.max_get_bytes
+
+        # Use token limit if specified, with buffer for JSON overhead
+        effective_token_limit = None
+        if max_tokens:
+            effective_token_limit = max_tokens - TOKEN_LIMIT_BUFFER
+            logger.debug(f"Token limit: {effective_token_limit} (buffer: {TOKEN_LIMIT_BUFFER})")
+
         results: list[DocContent] = []
-        total = 0
+        total_bytes = 0
+        total_tokens = 0
         merged_content_parts: list[str] = []
+        truncated_due_to_tokens = False
 
         for cid in ids:
             include_meta: ChromaInclude = ["metadatas"]
@@ -872,15 +954,47 @@ class IndexManager:
             host = str(meta.get("host", ""))
             header = f"# {title}\n"
             contribution = header + content
+
+            # Check token limit if enabled (explicitly check for not None)
+            if effective_token_limit is not None:
+                contribution_tokens = self.token_counter.count_tokens(contribution)
+                if total_tokens + contribution_tokens > effective_token_limit:
+                    # Try to fit partial content
+                    remaining_tokens = effective_token_limit - total_tokens
+                    if remaining_tokens <= 0:
+                        truncated_due_to_tokens = True
+                        logger.info(f"Reached token limit ({max_tokens}), truncating response")
+                        break
+
+                    # Truncate content to fit within token limit (rough approximation)
+                    # Estimate chars to keep based on token ratio
+                    char_per_token_ratio = (
+                        len(contribution) / contribution_tokens if contribution_tokens > 0 else 4
+                    )
+                    chars_to_keep = int(
+                        remaining_tokens * char_per_token_ratio * 0.9
+                    )  # 90% to be safe
+                    if chars_to_keep > 0:
+                        contribution = contribution[:chars_to_keep]
+                        contribution_tokens = self.token_counter.count_tokens(contribution)
+                        truncated_due_to_tokens = True
+                    else:
+                        break
+
+                total_tokens += contribution_tokens
+
+            # Also check byte limit
             contribution_bytes = contribution.encode("utf-8")
-            if total + len(contribution_bytes) > max_budget:
-                remaining = max_budget - total
+            if total_bytes + len(contribution_bytes) > max_budget:
+                remaining = max_budget - total_bytes
                 if remaining <= 0:
                     break
                 truncated = contribution_bytes[:remaining].decode("utf-8", errors="ignore")
                 contribution = truncated
                 contribution_bytes = truncated.encode("utf-8")
-            total += len(contribution_bytes)
+
+            total_bytes += len(contribution_bytes)
+
             if merge:
                 merged_content_parts.append(contribution)
             else:
@@ -893,12 +1007,22 @@ class IndexManager:
                         content=contribution,
                     )
                 )
-            if total >= max_budget:
+
+            if total_bytes >= max_budget:
                 break
 
+        response: dict[str, Any] = {
+            "merged": merge,
+            "total_tokens": total_tokens if effective_token_limit is not None else None,
+            "truncated_due_to_tokens": truncated_due_to_tokens,
+        }
+
         if merge:
-            return {"merged": True, "content": "\n\n".join(merged_content_parts)}
-        return {"merged": False, "items": results}
+            response["content"] = "\n\n".join(merged_content_parts)
+        else:
+            response["items"] = results
+
+        return response
 
     async def cleanup_expired_documents(self) -> int:
         """Remove documents older than TTL from unconfigured sources.
@@ -1145,8 +1269,22 @@ async def docs_query(
     retrieved_content: dict[str, DocContent] = {}
     merged_content = ""
 
+    total_tokens = None
+    truncated_due_to_tokens = False
+
     if ids_to_retrieve:
-        get_result = rm.index_manager.get(ids=ids_to_retrieve, max_bytes=max_bytes, merge=merge)
+        # Pass max_tokens from config
+        get_result = rm.index_manager.get(
+            ids=ids_to_retrieve,
+            max_bytes=max_bytes,
+            merge=merge,
+            max_tokens=rm.config.max_response_tokens,
+        )
+
+        # Extract token information
+        total_tokens = get_result.get("total_tokens")
+        truncated_due_to_tokens = get_result.get("truncated_due_to_tokens", False)
+
         if merge and get_result.get("merged"):
             merged_content = get_result["content"]
         else:
@@ -1154,13 +1292,58 @@ async def docs_query(
                 # item is already a DocContent object
                 retrieved_content[item.id] = item
 
-    return QueryResult(
+    # Create initial result
+    result = QueryResult(
         search_results=search_results,
         retrieved_content=retrieved_content,
         merged_content=merged_content,
         auto_retrieved_count=auto_retrieved_count,
         total_results=len(search_results),
+        total_tokens=total_tokens,
+        truncated_due_to_tokens=truncated_due_to_tokens,
     )
+    
+    # Count tokens in the complete response and truncate if needed
+    response_json = result.model_dump_json()
+    response_tokens = rm.index_manager.token_counter.count_tokens(response_json)
+    
+    # If response exceeds limit, reduce search results
+    if response_tokens > rm.config.max_response_tokens:
+        logger.info(f"Response ({response_tokens} tokens) exceeds limit ({rm.config.max_response_tokens}), truncating search results")
+        
+        # Reduce search results until we're under the limit
+        max_results = len(search_results)
+        for i in range(max_results - 1, 0, -1):  # Start from end, keep at least 1 result
+            truncated_result = QueryResult(
+                search_results=search_results[:i],
+                retrieved_content=retrieved_content,
+                merged_content=merged_content,
+                auto_retrieved_count=auto_retrieved_count,
+                total_results=i,
+                total_tokens=total_tokens,
+                truncated_due_to_tokens=True,
+            )
+            
+            truncated_json = truncated_result.model_dump_json()
+            truncated_tokens = rm.index_manager.token_counter.count_tokens(truncated_json)
+            
+            if truncated_tokens <= rm.config.max_response_tokens:
+                logger.info(f"Truncated to {i} search results ({truncated_tokens} tokens)")
+                return truncated_result
+        
+        # If even 1 result is too big, return minimal response
+        logger.warning("Even single result exceeds token limit, returning minimal response")
+        return QueryResult(
+            search_results=[],
+            retrieved_content={},
+            merged_content="Response too large - please use more specific query terms or filters",
+            auto_retrieved_count=0,
+            total_results=0,
+            total_tokens=None,
+            truncated_due_to_tokens=True,
+        )
+    
+    return result
 
 
 # -------------------------
@@ -1216,6 +1399,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-snippets", action="store_true", help="Disable content snippets in search results"
+    )
+    parser.add_argument(
+        "--max-response-tokens",
+        type=int,
+        default=DEFAULT_MAX_RESPONSE_TOKENS,
+        help=f"Maximum tokens in MCP response (default: {DEFAULT_MAX_RESPONSE_TOKENS})",
     )
     return parser.parse_args()
 
@@ -1299,6 +1488,7 @@ def main() -> None:
         include_snippets=not args.no_snippets,
         preindex=not args.no_preindex,
         background_preindex=not args.no_background_preindex,
+        max_response_tokens=args.max_response_tokens,
     )
 
     async def run_server() -> None:

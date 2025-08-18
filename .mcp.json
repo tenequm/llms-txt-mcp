@@ -15,8 +15,10 @@
         "llms-txt-mcp",
         "--store-path", "tmp/mcp-data",
         "https://ai-sdk.dev/llms.txt",
-        "https://gofastmcp.com/llms.txt",
-        "https://modelcontextprotocol.io/llms.txt"
+        "https://nextjs.org/docs/llms.txt",
+        "https://hono.dev/llms.txt",
+        "https://orm.drizzle.team/llms-full.txt",
+        "https://zod.dev/llms.txt"
       ]
     }
   }

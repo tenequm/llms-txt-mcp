@@ -129,6 +129,7 @@ async def server_setup(mock_http_client):
         include_snippets=True,
         preindex=False,
         background_preindex=False,
+        max_response_tokens=25000,
     )
 
     # Use the new managed_resources context manager
